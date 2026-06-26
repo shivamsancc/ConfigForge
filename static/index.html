@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ConfigForge</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <nav class="sidebar">
+    <div class="sidebar-brand">Config<span class="dot">Forge</span></div>
+    <div id="sidebar-nav"></div>
+    <div class="sidebar-footer">SNMP collector config generator</div>
+  </nav>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-title" id="topbar-title"></div>
+      <div class="topbar-stats" id="topbar-stats"></div>
+    </header>
+    <main class="content" id="content"></main>
+  </div>
+</div>
+
+<div id="toast-stack"></div>
+
+<!-- Vendored locally, no CDN — must run fully offline -->
+<script src="xlsx.full.min.js"></script>
+
+<script src="ui.js"></script>
+<script src="api.js"></script>
+<script src="devices.js"></script>
+<script src="bandwidth.js"></script>
+<script src="lists.js"></script>
+<script src="generate.js"></script>
+<script src="history.js"></script>
+<script src="audit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
