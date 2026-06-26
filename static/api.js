@@ -1,6 +1,5 @@
 // ============================================================================
-// API — thin wrapper around the backend REST endpoints.
-// Every function returns parsed JSON or throws an Error with a readable message.
+// API -- thin wrapper around the backend REST endpoints.
 // ============================================================================
 
 const Api = (() => {
@@ -22,8 +21,10 @@ const Api = (() => {
       try { data = JSON.parse(text); } catch (e) { /* non-JSON response */ }
     }
     if (!res.ok) {
-      const msg = (data && (data.error || data.message)) || res.statusText || `HTTP ${res.status}`;
-      throw new Error(msg);
+      const err = new Error((data && (data.error || data.message)) || res.statusText || `HTTP ${res.status}`);
+      err.status = res.status;
+      err.data = data;
+      throw err;
     }
     return data;
   }
@@ -45,15 +46,25 @@ const Api = (() => {
     deleteBandwidth: (id) => request('DELETE', `/api/bandwidth/${encodeURIComponent(id)}?_actor=${encodeURIComponent(getEditorName())}`),
     importBandwidth: (rows, mode) => request('POST', '/api/bandwidth/import', withActor({ rows, mode })),
 
-    // Lists
+    // Subnets
+    getSubnets: () => request('GET', '/api/subnets'),
+    saveSubnet: (subnet) => request('POST', '/api/subnets', withActor({ subnet })),
+    deleteSubnet: (id) => request('DELETE', `/api/subnets/${encodeURIComponent(id)}?_actor=${encodeURIComponent(getEditorName())}`),
+    importSubnets: (subnets, mode) => request('POST', '/api/subnets/import', withActor({ subnets, mode })),
+
+    // Fixed lists
     getLists: () => request('GET', '/api/lists'),
     setList: (listName, items) => request('POST', `/api/lists/${encodeURIComponent(listName)}`, withActor({ items })),
     getListUsage: (listName, value) => request('GET', `/api/lists/${encodeURIComponent(listName)}/usage?value=${encodeURIComponent(value)}`),
 
-    // Audit
-    getAudit: (limit = 100) => request('GET', `/api/audit?limit=${limit}`),
+    // Dynamic tags
+    getTags: () => request('GET', '/api/tags'),
+    saveTag: (tagDef) => request('POST', '/api/tags', withActor({ tagDef })),
+    deleteTag: (id, force = false) => request('DELETE', `/api/tags/${encodeURIComponent(id)}?_actor=${encodeURIComponent(getEditorName())}${force ? '&force=true' : ''}`),
+    getTagUsage: (id, value) => request('GET', `/api/tags/${encodeURIComponent(id)}/usage${value !== undefined ? `?value=${encodeURIComponent(value)}` : ''}`),
 
-    // History
+    // Audit / history
+    getAudit: (limit = 100) => request('GET', `/api/audit?limit=${limit}`),
     getHistory: (limit = 50) => request('GET', `/api/history?limit=${limit}`),
     getHistoryEntry: (id) => request('GET', `/api/history/${encodeURIComponent(id)}`),
 
@@ -62,5 +73,10 @@ const Api = (() => {
 
     // Meta
     getMeta: () => request('GET', '/api/meta'),
+
+    // Export (these are downloaded directly via downloadUrl, not fetched as JSON)
+    exportDevicesUrl: () => '/api/export/devices.xlsx',
+    exportBandwidthUrl: () => '/api/export/bandwidth.xlsx',
+    exportSubnetsUrl: () => '/api/export/subnets.xlsx',
   };
 })();

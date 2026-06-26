@@ -9,14 +9,22 @@
 <body>
 <div id="app">
   <nav class="sidebar">
-    <div class="sidebar-brand">Config<span class="dot">Forge</span></div>
+    <div class="brand">
+      <span id="brand-mark" class="brand-mark"></span>
+      <span class="brand-name">Config<span class="accent-word">Forge</span></span>
+    </div>
     <div id="sidebar-nav"></div>
-    <div class="sidebar-footer">SNMP collector config generator</div>
+    <div class="sidebar-footer">
+      <span>v1.0</span>
+      <a href="https://github.com/" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
   </nav>
 
   <div class="main">
     <header class="topbar">
-      <div class="topbar-title" id="topbar-title"></div>
+      <div>
+        <div class="topbar-title" id="topbar-title"></div>
+      </div>
       <div class="topbar-stats" id="topbar-stats"></div>
     </header>
     <main class="content" id="content"></main>
@@ -25,17 +33,21 @@
 
 <div id="toast-stack"></div>
 
-<!-- Vendored locally, no CDN — must run fully offline -->
+<!-- Vendored locally, no CDN -- must run fully offline -->
 <script src="xlsx.full.min.js"></script>
 
 <script src="ui.js"></script>
 <script src="api.js"></script>
+<script src="tagfields.js"></script>
 <script src="devices.js"></script>
 <script src="bandwidth.js"></script>
+<script src="subnets.js"></script>
+<script src="tags.js"></script>
 <script src="lists.js"></script>
 <script src="generate.js"></script>
 <script src="history.js"></script>
 <script src="audit.js"></script>
+<script src="dashboard.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

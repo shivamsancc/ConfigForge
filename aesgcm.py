@@ -1,26 +1,22 @@
 """
-Pure-Python AES-256-GCM, stdlib only.
+Pure-Python AES-256-GCM. Zero external dependencies.
 
-The AES-256 block-cipher core (key schedule + single-block encrypt) below
-is byte-for-byte verified against pycryptodome's AES-256-ECB across 2500+
-random trials during development (see test_aes.py / dev notes) -- this is
-real AES, not an approximation, just implemented in plain Python instead
-of C/OpenSSL. GCM mode (CTR encryption + GHASH authentication tag) is
-implemented on top per NIST SP 800-38D.
+Output format for encrypt(): iv(12 bytes) || ciphertext || tag(16 bytes),
+all concatenated and base64-encoded by the caller (storage.py).
 
-This module has zero third-party dependencies -- only used so the server
-can encrypt SNMPv3 credentials at rest in the shared SQLite file without
-requiring `pip install` on the machine that runs it.
+This is a from-scratch implementation: AES block cipher (S-box, key
+schedule, ShiftRows/MixColumns), GHASH over GF(2^128), and CTR mode for
+the actual encryption. It is NOT constant-time and should not be treated
+as hardened against timing side-channels — it exists so this project has
+zero pip dependencies, not as a general-purpose crypto library.
 """
-
 import os
 import struct
 
 # ---------------------------------------------------------------------------
-# AES-256 block cipher core
+# AES S-box and inverse S-box
 # ---------------------------------------------------------------------------
-
-_Sbox = [
+_SBOX = [
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
     0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
     0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
@@ -39,11 +35,17 @@ _Sbox = [
     0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
 ]
 
-_Rcon = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36,0x6c,0xd8,0xab,0x4d]
+_RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1B,0x36,0x6C,0xD8,0xAB,0x4D]
+
+
+def _xtime(a):
+    a <<= 1
+    if a & 0x100:
+        a ^= 0x11B
+    return a & 0xFF
 
 
 def _gmul(a, b):
-    """GF(2^8) multiply used by AES MixColumns (NOT the GHASH field -- see _ghash_mul)."""
     p = 0
     for _ in range(8):
         if b & 1:
@@ -57,122 +59,127 @@ def _gmul(a, b):
 
 
 def _key_expansion_256(key: bytes):
-    Nk, Nr = 8, 14
-    w = [list(key[4 * i:4 * i + 4]) for i in range(Nk)]
-    for i in range(Nk, 4 * (Nr + 1)):
+    nk = 8  # 256-bit key = 8 words
+    nr = 14  # rounds
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
         temp = list(w[i - 1])
-        if i % Nk == 0:
+        if i % nk == 0:
             temp = temp[1:] + temp[:1]
-            temp = [_Sbox[b] for b in temp]
-            temp[0] ^= _Rcon[i // Nk - 1]
-        elif i % Nk == 4:
-            temp = [_Sbox[b] for b in temp]
-        w.append([a ^ b for a, b in zip(w[i - Nk], temp)])
+            temp = [_SBOX[b] for b in temp]
+            temp[0] ^= _RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            temp = [_SBOX[b] for b in temp]
+        w.append([w[i - nk][j] ^ temp[j] for j in range(4)])
+    # Group into round keys (each round key = 4 words = 16 bytes)
     round_keys = []
-    for r in range(Nr + 1):
+    for r in range(nr + 1):
         rk = []
         for c in range(4):
-            rk += w[4 * r + c]
+            rk.extend(w[r * 4 + c])
         round_keys.append(bytes(rk))
     return round_keys
 
 
 def _add_round_key(state, rk):
-    for i in range(16):
-        state[i] ^= rk[i]
+    return bytes(s ^ k for s, k in zip(state, rk))
 
 
 def _sub_bytes(state):
-    for i in range(16):
-        state[i] = _Sbox[state[i]]
+    return bytes(_SBOX[b] for b in state)
 
 
 def _shift_rows(state):
-    new = state[:]
-    for r in range(1, 4):
-        for c in range(4):
-            new[c * 4 + r] = state[((c + r) % 4) * 4 + r]
-    state[:] = new
+    # state is column-major 4x4: state[r + 4*c]
+    out = bytearray(16)
+    for c in range(4):
+        for r in range(4):
+            out[r + 4 * c] = state[r + 4 * ((c + r) % 4)]
+    return bytes(out)
 
 
 def _mix_columns(state):
+    out = bytearray(16)
     for c in range(4):
-        a = state[c * 4:c * 4 + 4]
-        state[c * 4 + 0] = _gmul(a[0], 2) ^ _gmul(a[1], 3) ^ a[2] ^ a[3]
-        state[c * 4 + 1] = a[0] ^ _gmul(a[1], 2) ^ _gmul(a[2], 3) ^ a[3]
-        state[c * 4 + 2] = a[0] ^ a[1] ^ _gmul(a[2], 2) ^ _gmul(a[3], 3)
-        state[c * 4 + 3] = _gmul(a[0], 3) ^ a[1] ^ a[2] ^ _gmul(a[3], 2)
+        col = state[4 * c:4 * c + 4]
+        out[4 * c + 0] = _gmul(col[0], 2) ^ _gmul(col[1], 3) ^ col[2] ^ col[3]
+        out[4 * c + 1] = col[0] ^ _gmul(col[1], 2) ^ _gmul(col[2], 3) ^ col[3]
+        out[4 * c + 2] = col[0] ^ col[1] ^ _gmul(col[2], 2) ^ _gmul(col[3], 3)
+        out[4 * c + 3] = _gmul(col[0], 3) ^ col[1] ^ col[2] ^ _gmul(col[3], 2)
+    return bytes(out)
 
 
-def _aes256_encrypt_block(block16: bytes, round_keys) -> bytes:
-    state = list(block16)
-    _add_round_key(state, round_keys[0])
-    Nr = 14
-    for rnd in range(1, Nr):
-        _sub_bytes(state)
-        _shift_rows(state)
-        _mix_columns(state)
-        _add_round_key(state, round_keys[rnd])
-    _sub_bytes(state)
-    _shift_rows(state)
-    _add_round_key(state, round_keys[Nr])
-    return bytes(state)
+def _aes256_encrypt_block(block: bytes, round_keys) -> bytes:
+    nr = 14
+    state = _add_round_key(block, round_keys[0])
+    for rnd in range(1, nr):
+        state = _sub_bytes(state)
+        state = _shift_rows(state)
+        state = _mix_columns(state)
+        state = _add_round_key(state, round_keys[rnd])
+    state = _sub_bytes(state)
+    state = _shift_rows(state)
+    state = _add_round_key(state, round_keys[nr])
+    return state
 
 
 class _AES256:
-    """Thin wrapper holding the expanded key schedule."""
-
     def __init__(self, key: bytes):
         if len(key) != 32:
-            raise ValueError("AES-256 requires a 32-byte key")
-        self._rks = _key_expansion_256(key)
+            raise ValueError("AES-256 key must be 32 bytes")
+        self._round_keys = _key_expansion_256(key)
 
-    def encrypt_block(self, block16: bytes) -> bytes:
-        return _aes256_encrypt_block(block16, self._rks)
+    def encrypt_block(self, block: bytes) -> bytes:
+        return _aes256_encrypt_block(block, self._round_keys)
 
 
 # ---------------------------------------------------------------------------
-# GHASH (GF(2^128) multiplication per NIST SP 800-38D)
+# GHASH over GF(2^128) for GCM authentication
 # ---------------------------------------------------------------------------
+_R = 0xE1000000000000000000000000000000
 
-_R = 0xE1000000000000000000000000000000  # reduction constant for GF(2^128)
 
-
-def _ghash_mul(x: int, y: int) -> int:
-    """Multiply two 128-bit integers in the GHASH Galois field."""
+def _gf128_mul(x: int, y: int) -> int:
     z = 0
-    v = x
     for i in range(127, -1, -1):
-        if (y >> i) & 1:
-            z ^= v
-        if v & 1:
-            v = (v >> 1) ^ _R
+        if (x >> i) & 1:
+            z ^= y
+        if y & 1:
+            y = (y >> 1) ^ _R
         else:
-            v >>= 1
-    return z
+            y >>= 1
+    return z & ((1 << 128) - 1)
 
 
-def _ghash(h_int: int, data: bytes) -> int:
+def _ghash(h: int, data: bytes) -> int:
     y = 0
     for i in range(0, len(data), 16):
         block = data[i:i + 16]
         if len(block) < 16:
             block = block + b"\x00" * (16 - len(block))
-        y = _ghash_mul(y ^ int.from_bytes(block, "big"), h_int)
+        y ^= int.from_bytes(block, "big")
+        y = _gf128_mul(y, h)
     return y
 
 
+def _ghash_full(h: int, aad: bytes, ciphertext: bytes) -> bytes:
+    def pad16(b):
+        rem = len(b) % 16
+        return b if rem == 0 else b + b"\x00" * (16 - rem)
+
+    data = pad16(aad) + pad16(ciphertext)
+    data += struct.pack(">QQ", len(aad) * 8, len(ciphertext) * 8)
+    y = _ghash(h, data)
+    return y.to_bytes(16, "big")
+
+
 def _inc32(block: bytes) -> bytes:
-    """Increment the low 32 bits of a 16-byte counter block, per GCM spec."""
-    prefix, ctr = block[:12], int.from_bytes(block[12:], "big")
-    ctr = (ctr + 1) & 0xFFFFFFFF
-    return prefix + ctr.to_bytes(4, "big")
+    counter = int.from_bytes(block[-4:], "big")
+    counter = (counter + 1) & 0xFFFFFFFF
+    return block[:-4] + counter.to_bytes(4, "big")
 
 
 def _gctr(aes: _AES256, icb: bytes, data: bytes) -> bytes:
-    """AES-CTR using the GCM-specific counter increment (32-bit, wraps)."""
-    if not data:
-        return b""
     out = bytearray()
     counter = icb
     for i in range(0, len(data), 16):
@@ -183,70 +190,44 @@ def _gctr(aes: _AES256, icb: bytes, data: bytes) -> bytes:
     return bytes(out)
 
 
-def _build_j0(aes: _AES256, h_int: int, iv: bytes) -> bytes:
-    if len(iv) == 12:
-        return iv + b"\x00\x00\x00\x01"
-    # Rare path: non-96-bit IV. Hash it down to 128 bits via GHASH.
-    s = len(iv) * 8
-    padded_len = ((len(iv) + 15) // 16) * 16
-    data = iv + b"\x00" * (padded_len - len(iv))
-    data += b"\x00" * 8 + struct.pack(">Q", s)
-    y = _ghash(h_int, data)
-    return y.to_bytes(16, "big")
-
-
-def encrypt(key: bytes, plaintext: bytes, associated_data: bytes = b"") -> bytes:
-    """
-    AES-256-GCM encrypt. Returns iv(12) || ciphertext || tag(16), all
-    concatenated -- a self-contained blob safe to store as one value.
-    """
+def encrypt(key: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+    """Returns iv(12) || ciphertext || tag(16)."""
     aes = _AES256(key)
     iv = os.urandom(12)
-    h_int = int.from_bytes(aes.encrypt_block(b"\x00" * 16), "big")
-    j0 = _build_j0(aes, h_int, iv)
+    h = int.from_bytes(aes.encrypt_block(b"\x00" * 16), "big")
+    j0 = iv + b"\x00\x00\x00\x01"
+    # Ciphertext encryption starts at J0+1; J0 itself is reserved for the
+    # auth tag mask below (GCM spec, NIST SP 800-38D section 7.1).
     ciphertext = _gctr(aes, _inc32(j0), plaintext)
-
-    aad_padded_len = ((len(associated_data) + 15) // 16) * 16 if associated_data else 0
-    ct_padded_len = ((len(ciphertext) + 15) // 16) * 16 if ciphertext else 0
-    auth_data = (
-        associated_data + b"\x00" * (aad_padded_len - len(associated_data))
-        + ciphertext + b"\x00" * (ct_padded_len - len(ciphertext))
-        + struct.pack(">QQ", len(associated_data) * 8, len(ciphertext) * 8)
-    )
-    s_int = _ghash(h_int, auth_data)
-    tag = bytes(a ^ b for a, b in zip(s_int.to_bytes(16, "big"), aes.encrypt_block(j0)))
-
+    s = _ghash_full(h, aad, ciphertext)
+    auth_keystream = aes.encrypt_block(j0)
+    tag = bytes(a ^ b for a, b in zip(s, auth_keystream))
     return iv + ciphertext + tag
 
 
-def decrypt(key: bytes, blob: bytes, associated_data: bytes = b"") -> bytes:
-    """
-    Inverse of encrypt(): blob is iv(12) || ciphertext || tag(16).
-    Raises ValueError if the authentication tag does not match (tampered
-    or wrong key) -- callers must not ignore this.
-    """
+def decrypt(key: bytes, blob: bytes, aad: bytes = b"") -> bytes:
+    """Input: iv(12) || ciphertext || tag(16). Raises ValueError on tamper."""
     if len(blob) < 28:
-        raise ValueError("ciphertext blob too short to contain iv+tag")
-    iv, ciphertext, tag = blob[:12], blob[12:-16], blob[-16:]
-
+        raise ValueError("ciphertext too short")
+    iv = blob[:12]
+    tag = blob[-16:]
+    ciphertext = blob[12:-16]
     aes = _AES256(key)
-    h_int = int.from_bytes(aes.encrypt_block(b"\x00" * 16), "big")
-    j0 = _build_j0(aes, h_int, iv)
+    h = int.from_bytes(aes.encrypt_block(b"\x00" * 16), "big")
+    j0 = iv + b"\x00\x00\x00\x01"
+    s = _ghash_full(h, aad, ciphertext)
+    auth_keystream = aes.encrypt_block(j0)
+    expected_tag = bytes(a ^ b for a, b in zip(s, auth_keystream))
+    if not _consteq(expected_tag, tag):
+        raise ValueError("authentication tag mismatch (tampered or wrong key)")
+    # Decryption (like encryption) starts at J0+1.
+    return _gctr(aes, _inc32(j0), ciphertext)
 
-    aad_padded_len = ((len(associated_data) + 15) // 16) * 16 if associated_data else 0
-    ct_padded_len = ((len(ciphertext) + 15) // 16) * 16 if ciphertext else 0
-    auth_data = (
-        associated_data + b"\x00" * (aad_padded_len - len(associated_data))
-        + ciphertext + b"\x00" * (ct_padded_len - len(ciphertext))
-        + struct.pack(">QQ", len(associated_data) * 8, len(ciphertext) * 8)
-    )
-    s_int = _ghash(h_int, auth_data)
-    expected_tag = bytes(a ^ b for a, b in zip(s_int.to_bytes(16, "big"), aes.encrypt_block(j0)))
 
-    # Constant-time-ish comparison
-    import hmac as _hmac
-    if not _hmac.compare_digest(expected_tag, tag):
-        raise ValueError("GCM authentication tag mismatch -- data is corrupt or key is wrong")
-
-    plaintext = _gctr(aes, _inc32(j0), ciphertext)
-    return plaintext
+def _consteq(a: bytes, b: bytes) -> bool:
+    if len(a) != len(b):
+        return False
+    r = 0
+    for x, y in zip(a, b):
+        r |= x ^ y
+    return r == 0

@@ -13,10 +13,6 @@ const Devices = (() => {
   ];
 
   const DROPDOWN_FIELDS = [
-    // "flagged" (not "required") on purpose: a device with no Collector Region
-    // is a valid, save-able state — it just gets excluded from generated YAML
-    // and surfaced in missingRegionDevices. HTML5 `required` would make that
-    // state impossible to save, which contradicts the generate-time tracking.
     { key: 'Collector Region', label: 'Collector Region', listKey: 'collectorRegions', flagged: true },
     { key: 'Device Class', label: 'Device Class', listKey: 'deviceClasses' },
     { key: 'Device Category', label: 'Device Category', listKey: 'deviceCategories' },
@@ -35,7 +31,7 @@ const Devices = (() => {
 
   function credBadge(d) {
     if (isIcmpForced(d)) return `<span class="badge badge-neutral">ICMP-only</span>`;
-    if (missingCreds(d)) return `<span class="badge badge-warn">SNMP ⚠</span>`;
+    if (missingCreds(d)) return `<span class="badge badge-warn">SNMP &#9888;</span>`;
     return `<span class="badge badge-ok">SNMP</span>`;
   }
 
@@ -46,29 +42,45 @@ const Devices = (() => {
 
   async function render() {
     const content = document.getElementById('content');
+    const mode = state.viewMode.devices;
     content.innerHTML = `
-      <div class="flex justify-between items-center mb-16">
-        <div class="flex gap-8">
+      <div class="flex justify-between items-center mb-16 wrap gap-12">
+        <div class="flex gap-8 wrap">
           <button class="btn btn-primary" id="btn-add-device">+ Add Device</button>
           <button class="btn" id="btn-import-devices">Import from Excel</button>
+          <button class="btn" id="btn-export-devices">Export to Excel</button>
         </div>
-        <div class="text-dim">${state.devices.length} device(s)</div>
-      </div>
-      <div class="panel">
-        <div class="table-wrap">
-          ${renderTable()}
+        <div class="flex gap-12 items-center">
+          <div class="text-dim">${state.devices.length} device(s)</div>
+          <div class="view-toggle">
+            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
+            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
+          </div>
         </div>
       </div>
+      <div id="devices-body"></div>
     `;
-    wireTableActions();
+    renderBody();
+
     document.getElementById('btn-add-device').addEventListener('click', () => openForm(null));
     document.getElementById('btn-import-devices').addEventListener('click', () => openImportDialog());
+    document.getElementById('btn-export-devices').addEventListener('click', handleExport);
+    content.querySelectorAll('.view-toggle button').forEach(btn => {
+      btn.addEventListener('click', () => { state.viewMode.devices = btn.dataset.mode; render(); });
+    });
+  }
+
+  function renderBody() {
+    const body = document.getElementById('devices-body');
+    if (state.devices.length === 0) {
+      body.innerHTML = emptyState({ title: 'No devices yet', sub: 'Add one manually or import a spreadsheet to get started.' });
+      return;
+    }
+    body.innerHTML = state.viewMode.devices === 'card' ? renderCards() : `<div class="panel"><div class="table-wrap">${renderTable()}</div></div>`;
+    wireRowActions();
   }
 
   function renderTable() {
-    if (state.devices.length === 0) {
-      return `<div class="empty-state">No devices yet. Add one or import from Excel.</div>`;
-    }
     const rows = state.devices.map(d => `
       <tr data-id="${escapeHtml(d.id)}">
         <td class="mono">${escapeHtml(d.IP)}</td>
@@ -78,11 +90,7 @@ const Devices = (() => {
         <td>${escapeHtml(d['Device Class'])}</td>
         <td>${escapeHtml(d['Device Category'])}</td>
         <td>${escapeHtml(d['Device Type'])}</td>
-        <td>${escapeHtml(d.Region)}</td>
-        <td>${escapeHtml(d.Center)}</td>
-        <td>${escapeHtml(d['Operating Region'])}</td>
-        <td>${escapeHtml(d.geolocation)}</td>
-        <td>${(d.customTags || []).map(t => `<span class="badge badge-neutral">${escapeHtml(t)}</span>`).join(' ')}</td>
+        <td>${TagFields.renderBadges('devices', d.tags) || '<span class="text-faint">&mdash;</span>'}</td>
         <td>${credBadge(d)}</td>
         <td>
           <button class="btn btn-sm" data-act="edit">Edit</button>
@@ -96,7 +104,6 @@ const Devices = (() => {
         <thead><tr>
           <th>IP</th><th>Device</th><th>Collector Region</th><th>Config Type</th>
           <th>Device Class</th><th>Device Category</th><th>Device Type</th>
-          <th>Region</th><th>Center</th><th>Operating Region</th><th>Geolocation</th>
           <th>Tags</th><th>Status</th><th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -104,14 +111,36 @@ const Devices = (() => {
     `;
   }
 
-  function wireTableActions() {
-    document.querySelectorAll('#content tbody tr').forEach(tr => {
-      const id = tr.dataset.id;
+  function renderCards() {
+    const cards = state.devices.map(d => `
+      <div class="data-card" data-id="${escapeHtml(d.id)}" data-act-card="edit">
+        <div class="data-card-header">
+          <div>
+            <div class="data-card-title">${escapeHtml(d.Device || '(unnamed)')}</div>
+            <div class="data-card-sub">${escapeHtml(d.IP)}</div>
+          </div>
+          ${credBadge(d)}
+        </div>
+        <div class="data-card-meta">
+          ${regionBadge(d)}
+          ${d['Device Class'] ? `<span class="badge badge-neutral">${escapeHtml(d['Device Class'])}</span>` : ''}
+          ${TagFields.renderBadges('devices', d.tags)}
+        </div>
+        <div class="data-card-actions">
+          <button class="btn btn-sm" data-act="edit">Edit</button>
+          <button class="btn btn-sm btn-danger" data-act="delete">Delete</button>
+        </div>
+      </div>
+    `).join('');
+    return `<div class="card-grid">${cards}</div>`;
+  }
+
+  function wireRowActions() {
+    document.querySelectorAll('#devices-body [data-id]').forEach(el => {
+      const id = el.dataset.id;
       const device = state.devices.find(d => String(d.id) === String(id));
-      const editBtn = tr.querySelector('[data-act="edit"]');
-      const delBtn = tr.querySelector('[data-act="delete"]');
-      if (editBtn) editBtn.addEventListener('click', () => openForm(device));
-      if (delBtn) delBtn.addEventListener('click', () => handleDelete(device));
+      el.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); openForm(device); }));
+      el.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); handleDelete(device); }));
     });
   }
 
@@ -132,7 +161,7 @@ const Devices = (() => {
   function listOptions(listKey, currentValue) {
     const items = (state.lists[listKey] || []);
     const opts = items.map(v => `<option value="${escapeHtml(v)}"${v === currentValue ? ' selected' : ''}>${escapeHtml(v)}</option>`);
-    return `<option value="">— none —</option>${opts.join('')}`;
+    return `<option value="">&mdash; none &mdash;</option>${opts.join('')}`;
   }
 
   function openForm(device) {
@@ -159,30 +188,31 @@ const Devices = (() => {
             ${DROPDOWN_FIELDS.map(f => `
               <div class="field">
                 <label>${escapeHtml(f.label)}${f.flagged ? '<span class="req">*</span>' : ''}</label>
-                <select name="${f.key}">
-                  ${listOptions(f.listKey, d[f.key] || '')}
-                </select>
-                ${f.flagged ? `<span class="field-hint">Needed for this device to appear in generated YAML — devices without it are saved but excluded at generate time.</span>` : ''}
+                <select name="${f.key}">${listOptions(f.listKey, d[f.key] || '')}</select>
+                ${f.flagged ? `<span class="field-hint">Needed for this device to appear in generated YAML.</span>` : ''}
               </div>
             `).join('')}
             <div class="field">
               <label>Config Type</label>
               <select name="Config Type">
-                <option value="">— none —</option>
+                <option value="">&mdash; none &mdash;</option>
                 ${['SNMP', 'ICMP', 'SNMP Trap'].map(v => `<option value="${v}"${(d['Config Type'] || '') === v ? ' selected' : ''}>${v}</option>`).join('')}
               </select>
               <span class="field-hint">ICMP / SNMP Trap force ping-only regardless of credentials.</span>
             </div>
-            <div class="field">
-              <label>Custom Tags</label>
-              <input type="text" name="customTags" value="${escapeHtml((d.customTags || []).join(', '))}" placeholder="env:prod, site:hq">
-              <span class="field-hint">Comma-separated.</span>
-            </div>
           </div>
 
           <div class="panel-header" style="padding:0 0 10px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;">
-            <h2 style="font-size:13px;color:var(--text-dim);">SNMPv3 Credentials</h2>
+            <h2 style="font-size:13px;color:var(--text-dim);">Tags</h2>
           </div>
+          <div class="form-grid mb-16">
+            ${TagFields.renderFormFields('devices', d.tags)}
+          </div>
+
+          <div class="panel-header" style="padding:0 0 10px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;">
+            <h2 style="font-size:13px;color:var(--text-dim);">SNMPv3 Credentials <span class="req">*</span></h2>
+          </div>
+          <div class="field-hint mb-12">Required for SNMP polling. Devices missing any of these are still included at generate time, flagged as needing attention.</div>
           <div class="form-grid">
             <div class="field">
               <label>SNMP User</label>
@@ -190,9 +220,7 @@ const Devices = (() => {
             </div>
             <div class="field">
               <label>Auth Protocol</label>
-              <select name="authProtocol">
-                ${['SHA', 'MD5'].map(v => `<option value="${v}"${(d.authProtocol || 'SHA') === v ? ' selected' : ''}>${v}</option>`).join('')}
-              </select>
+              <select name="authProtocol">${['SHA', 'MD5'].map(v => `<option value="${v}"${(d.authProtocol || 'SHA') === v ? ' selected' : ''}>${v}</option>`).join('')}</select>
             </div>
             <div class="field">
               <label>Auth Key</label>
@@ -203,9 +231,7 @@ const Devices = (() => {
             </div>
             <div class="field">
               <label>Priv Protocol</label>
-              <select name="privProtocol">
-                ${['AES', 'DES'].map(v => `<option value="${v}"${(d.privProtocol || 'AES') === v ? ' selected' : ''}>${v}</option>`).join('')}
-              </select>
+              <select name="privProtocol">${['AES', 'DES'].map(v => `<option value="${v}"${(d.privProtocol || 'AES') === v ? ' selected' : ''}>${v}</option>`).join('')}</select>
             </div>
             <div class="field">
               <label>Priv Key</label>
@@ -234,10 +260,7 @@ const Devices = (() => {
       });
     });
     if (isEdit) {
-      overlay.querySelector('[data-act="delete"]').addEventListener('click', async () => {
-        closeModal(overlay);
-        await handleDelete(d);
-      });
+      overlay.querySelector('[data-act="delete"]').addEventListener('click', async () => { closeModal(overlay); await handleDelete(d); });
     }
     overlay.querySelector('[data-act="save"]').addEventListener('click', async () => {
       const form = overlay.querySelector('#device-form');
@@ -245,21 +268,14 @@ const Devices = (() => {
       const fd = new FormData(form);
       const payload = isEdit ? { id: d.id } : {};
       for (const [k, v] of fd.entries()) {
-        if (k === 'customTags') {
-          payload[k] = v.split(',').map(s => s.trim()).filter(Boolean);
-        } else {
-          payload[k] = v;
-        }
+        if (!k.startsWith('tag__')) payload[k] = v;
       }
-      if (!payload.customTags) payload.customTags = [];
+      payload.tags = TagFields.readFormFields(fd);
       try {
         const saved = await Api.saveDevice(payload);
         const newDevice = saved.device || saved;
-        if (isEdit) {
-          state.devices = state.devices.map(dev => dev.id === d.id ? newDevice : dev);
-        } else {
-          state.devices.push(newDevice);
-        }
+        if (isEdit) state.devices = state.devices.map(dev => dev.id === d.id ? newDevice : dev);
+        else state.devices.push(newDevice);
         toast(isEdit ? 'Device updated' : 'Device added', 'success');
         closeModal(overlay);
         render();
@@ -271,7 +287,7 @@ const Devices = (() => {
   }
 
   // -------------------------------------------------------------------------
-  // Excel import
+  // Excel import / export
   // -------------------------------------------------------------------------
   const CRED_ALIASES = {
     snmpUser: ['snmpUser', 'SNMP User', 'User', 'Username'],
@@ -285,21 +301,22 @@ const Devices = (() => {
     'Operating Region': ['Operating Region', 'OperatingRegion'],
     'Config Type': ['Config Type', 'ConfigType'],
     'geolocation': ['geolocation', 'Geolocation'],
-    'Region': ['Region'],
-    'Center': ['Center'],
+    'Region': ['Region'], 'Center': ['Center'],
     'Device Class': ['Device Class', 'DeviceClass'],
     'Device Category': ['Device Category', 'DeviceCategory'],
     'Device Type': ['Device Type', 'DeviceType'],
-    'Device': ['Device'],
-    'IP': ['IP'],
-    'Remarks': ['Remarks'],
+    'Device': ['Device'], 'IP': ['IP'], 'Remarks': ['Remarks'],
   };
 
   function readAliased(row, aliases) {
-    for (const a of aliases) {
-      if (row[a] !== undefined && row[a] !== '') return String(row[a]);
-    }
+    for (const a of aliases) if (row[a] !== undefined && row[a] !== '') return String(row[a]);
     return '';
+  }
+
+  function handleExport() {
+    downloadUrl(Api.exportDevicesUrl(), 'devices_export.xlsx')
+      .then(() => toast('Devices exported', 'success'))
+      .catch(e => reportError(e, 'Export failed'));
   }
 
   function openImportDialog() {
@@ -312,6 +329,7 @@ const Devices = (() => {
         <div class="import-dialog-section">
           <h4>1. Choose file</h4>
           <input type="file" id="import-file" accept=".xlsx,.xls">
+          <div class="field-hint" style="margin-top:6px;">Tip: use "Export to Excel" first to get a template with the right columns, including any custom tags.</div>
         </div>
         <div class="import-dialog-section" id="import-sheet-section" style="display:none;">
           <h4>2. Choose sheet</h4>
@@ -367,33 +385,34 @@ const Devices = (() => {
       const sheet = workbook.Sheets[sheetSelect.value];
       const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
       const mode = overlay.querySelector('input[name="import-mode"]:checked').value;
+      const deviceTagDefs = TagFields.defsForScope('devices');
 
       const records = [];
       for (const r of rows) {
         if (!String(r['IP'] || '').trim()) continue;
         const rec = {};
-        for (const [field, aliases] of Object.entries(FIELD_ALIASES)) {
-          rec[field] = readAliased(r, aliases);
-        }
+        for (const [field, aliases] of Object.entries(FIELD_ALIASES)) rec[field] = readAliased(r, aliases);
         rec.snmpUser = readAliased(r, CRED_ALIASES.snmpUser);
         rec.authProtocol = readAliased(r, CRED_ALIASES.authProtocol) || 'SHA';
         rec.authKey = readAliased(r, CRED_ALIASES.authKey);
         rec.privProtocol = readAliased(r, CRED_ALIASES.privProtocol) || 'AES';
         rec.privKey = readAliased(r, CRED_ALIASES.privKey);
-        rec.customTags = [];
+        rec.tags = {};
+        for (const td of deviceTagDefs) {
+          const v = r[td.name];
+          if (v !== undefined && v !== '') rec.tags[td.id] = String(v);
+        }
         records.push(rec);
       }
 
       try {
         importBtn.disabled = true;
-        importBtn.textContent = 'Importing…';
-        const result = await Api.importDevices(records, mode);
+        importBtn.textContent = 'Importing\u2026';
+        await Api.importDevices(records, mode);
+        await TagFields.registerNewValuesFromImport('devices', records);
         toast(`Imported ${records.length} device(s) (${mode})`, 'success');
         closeModal(overlay);
-        const fresh = await Api.getDevices();
-        state.devices = fresh.devices || [];
-        const freshLists = await Api.getLists();
-        state.lists = Object.assign(state.lists, freshLists.lists || freshLists || {});
+        await reloadAllData();
         render();
         refreshCounts();
       } catch (e) {

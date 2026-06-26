@@ -1,5 +1,5 @@
 // ============================================================================
-// MANAGE LISTS VIEW
+// MANAGE LISTS VIEW (fixed: Collector Region, Device Class, Device Category, Device Type)
 // ============================================================================
 
 const Lists = (() => {
@@ -14,14 +14,12 @@ const Lists = (() => {
     const content = document.getElementById('content');
     content.innerHTML = LIST_DEFS.map(def => `
       <div class="panel mb-16">
-        <div class="panel-header">
-          <h2>${escapeHtml(def.label)}</h2>
-        </div>
+        <div class="panel-header"><h2>${escapeHtml(def.label)}</h2></div>
         <div class="panel-body">
           ${def.hint ? `<div class="field-hint mb-12">${escapeHtml(def.hint)}</div>` : ''}
           <div class="list-chip-row" id="chips-${def.key}"></div>
           <div class="add-row">
-            <input type="text" id="add-input-${def.key}" placeholder="Add new ${escapeHtml(def.label.toLowerCase())}…">
+            <input type="text" id="add-input-${def.key}" placeholder="Add new ${escapeHtml(def.label.toLowerCase())}&hellip;">
             <button class="btn btn-primary btn-sm" data-add="${def.key}">Add</button>
           </div>
         </div>
@@ -29,15 +27,10 @@ const Lists = (() => {
     `).join('');
 
     LIST_DEFS.forEach(def => renderChips(def.key));
-
-    document.querySelectorAll('[data-add]').forEach(btn => {
-      btn.addEventListener('click', () => handleAdd(btn.dataset.add));
-    });
+    document.querySelectorAll('[data-add]').forEach(btn => btn.addEventListener('click', () => handleAdd(btn.dataset.add)));
     LIST_DEFS.forEach(def => {
       const input = document.getElementById(`add-input-${def.key}`);
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') { e.preventDefault(); handleAdd(def.key); }
-      });
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); handleAdd(def.key); } });
     });
   }
 
@@ -64,10 +57,7 @@ const Lists = (() => {
     const value = input.value.trim();
     if (!value) return;
     const current = state.lists[listKey] || [];
-    if (current.includes(value)) {
-      toast('That value already exists in the list', 'warn');
-      return;
-    }
+    if (current.includes(value)) { toast('That value already exists in the list', 'warn'); return; }
     const updated = [...current, value];
     try {
       await Api.setList(listKey, updated);
@@ -81,20 +71,13 @@ const Lists = (() => {
   }
 
   async function handleRemove(listKey, value) {
-    let usageCount = null;
-    try {
-      const usage = await Api.getListUsage(listKey, value);
-      usageCount = usage.count;
-    } catch (e) {
-      // Non-fatal — proceed without the usage count if the endpoint fails.
-    }
-
-    const message = usageCount
-      ? `${usageCount} device(s) currently use "${value}". They'll keep their stored value, but it won't be selectable for new entries. Remove it from the list anyway?`
-      : `Remove "${value}" from this list?`;
-
-    const ok = await confirmDialog(message, { confirmLabel: 'Remove' });
-    if (!ok) return;
+    const def = LIST_DEFS.find(d => d.key === listKey);
+    const proceed = await confirmDependentDelete({
+      itemLabel: `"${value}" in ${def ? def.label : listKey}`,
+      checkUsage: () => Api.getListUsage(listKey, value).then(r => r.count),
+      zeroUsageMessage: `Remove "${value}" from this list?`,
+    });
+    if (!proceed) return;
 
     const updated = (state.lists[listKey] || []).filter(v => v !== value);
     try {

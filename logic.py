@@ -1,296 +1,199 @@
 """
-Core SNMP/ICMP collector-config conversion logic.
+Core conversion logic: devices + bandwidth caps + subnets + tag defs
+-> per-collector-region YAML-ready config dicts.
 
-This is a faithful Python port of logic.js from the browser-based v1/v2
-tool. Behavior is intentionally identical:
-
-  - A device with no Collector Region is EXCLUDED from all output (and
-    reported in `missing_region_devices`) -- region is mandatory for
-    inclusion in any generated YAML.
-  - A device with Config Type forcing ICMP (or Device Class == Storage)
-    is always emitted as ping-only, regardless of whether it has
-    credentials.
-  - A device that should be SNMP but is missing any of its 5 per-device
-    credential fields (snmpUser/authProtocol/authKey/privProtocol/privKey)
-    is still emitted (so the file generates), but flagged in
-    `missing_creds_devices` so the UI can surface a warning.
-  - Arista-style "Eth N" / "Eth N.M" interfaces match by index; everything
-    else matches by name. Dotted sub-indexes are kept as strings so
-    trailing zeros aren't dropped by numeric coercion (e.g. "54.200").
+Kept as plain functions operating on plain dicts/lists (no SQLite, no
+encryption) so it's easy to unit test in isolation and reason about.
 """
-
 import re
+import ipaddress
 
-COUNTRY_CODES = {
-    "South Africa": "ZA", "India": "IN", "Philippines": "PH",
-    "United States": "US", "US": "US", "United Kingdom": "GB",
-    "Europe": "EU", "Romania": "RO", "Bulgaria": "BG",
-    "Czech Republic": "CZ", "Singapore": "SG", "Germany": "DE",
-}
-
-FORCE_ICMP_CONFIG_TYPES = {"ICMP", "SNMP TRAP"}
-
-_ETH_RE = re.compile(r"^Eth\s*(\d+(?:\.\d+)?)$", re.IGNORECASE)
+ARISTA_ETH_RE = re.compile(r"^Eth\s*(\d+(?:\.\d+)?)$", re.IGNORECASE)
 
 
-def safe_str(v) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, float) and v != v:  # NaN
-        return ""
-    s = str(v).strip()
-    if s.lower() == "nan":
-        return ""
-    return s
+def normalize_group_key(region: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", region.strip().lower())
+    return key.strip("_") or "unknown"
 
 
-def sanitize_tag_value(value) -> str:
-    s = safe_str(value)
-    if not s:
-        return "unknown"
-    return s.replace(" ", "_")
+def should_be_icmp_only(device: dict) -> bool:
+    cls = (device.get("Device Class") or "").strip().lower()
+    cfg = (device.get("Config Type") or "").strip().lower()
+    return cls == "storage" or cfg in ("icmp", "snmp trap")
 
 
-def sanitize_filename(name) -> str:
-    return str(name).lower().replace(" ", "_").replace("-", "_")
+def has_full_creds(device: dict) -> bool:
+    return all([
+        device.get("snmpUser"), device.get("authProtocol"), device.get("authKey"),
+        device.get("privProtocol"), device.get("privKey"),
+    ])
 
 
-def parse_bandwidth(bw_string) -> int:
-    s = safe_str(bw_string)
-    m = re.search(r"([\d.]+)\s*(Gbps|Mbps|Kbps|bps)", s, re.IGNORECASE)
+def _parse_bw_to_bps(value: str):
+    """Parse strings like '1 Gbps', '500 Mbps', '100kbps' into bits/sec."""
+    if not value:
+        return None
+    m = re.match(r"^\s*([\d.]+)\s*([a-zA-Z]+)\s*$", value)
     if not m:
-        return 0
-    value = float(m.group(1))
+        return None
+    num = float(m.group(1))
     unit = m.group(2).lower()
-    if unit == "gbps":
-        return round(value * 1_000_000_000)
-    if unit == "mbps":
-        return round(value * 1_000_000)
-    if unit == "kbps":
-        return round(value * 1_000)
-    return round(value)
+    multipliers = {
+        "bps": 1, "kbps": 1_000, "mbps": 1_000_000, "gbps": 1_000_000_000,
+        "kb": 1_000, "mb": 1_000_000, "gb": 1_000_000_000,
+    }
+    mult = multipliers.get(unit)
+    if mult is None:
+        return None
+    return int(num * mult)
 
 
-def get_interface_match(interface_raw, log=None):
-    """
-    Eth N / Eth N.M (Arista index-style interfaces) -> index match;
-    everything else -> name match. Dotted sub-indexes kept as strings so
-    trailing zeros aren't dropped by numeric coercion.
-    """
-    interface_str = safe_str(interface_raw)
-    m = _ETH_RE.match(interface_str)
+def _interface_match(interface_name: str) -> dict:
+    """Arista 'Eth N' (optionally with a decimal sub-id, e.g. 'Eth 54.200')
+    matches by ifIndex; everything else matches by interface name string."""
+    m = ARISTA_ETH_RE.match((interface_name or "").strip())
     if m:
-        raw = m.group(1)
-        match_value = raw if "." in raw else int(raw)
-        if log:
-            log(f"'{interface_str}' -> auto-converted to index: {match_value}")
-        return "index", match_value
-    return "name", interface_str
+        return {"match_field": "index", "match_value": m.group(1)}
+    return {"match_field": "name", "match_value": interface_name}
 
 
-def should_be_icmp_only(device_class, config_type) -> bool:
-    if safe_str(device_class).lower() == "storage":
-        return True
-    ct = safe_str(config_type).upper()
-    if ct in FORCE_ICMP_CONFIG_TYPES:
-        return True
-    return False
+def resolve_tags_for_record(record: dict, tag_defs: list, subnet_match=None) -> dict:
+    """Returns {tagName: value} for all non-empty tags on this record,
+    after filling in any empty tag from a matching subnet's value (only
+    for tags whose scope includes 'subnets' AND the record's own scope --
+    i.e. subnet inheritance only fills gaps, never overrides an explicit
+    value the record already has)."""
+    own_tags = record.get("tags") or {}
+    resolved = {}
+    for td in tag_defs:
+        tag_id = td["id"]
+        value = own_tags.get(tag_id)
+        if not value and subnet_match and "subnets" in td.get("scopes", []):
+            value = (subnet_match.get("tags") or {}).get(tag_id)
+        if value:
+            resolved[td["name"]] = value
+    return resolved
 
 
-def has_complete_credentials(device: dict) -> bool:
-    """
-    A device's own SNMPv3 fields are considered "complete" only if every
-    one of the five fields is non-empty.
-    """
-    return bool(
-        safe_str(device.get("snmpUser"))
-        and safe_str(device.get("authProtocol"))
-        and safe_str(device.get("authKey"))
-        and safe_str(device.get("privProtocol"))
-        and safe_str(device.get("privKey"))
-    )
+def convert_to_collector_configs(devices: list, bandwidth_rows: list, subnets: list = None,
+                                   tag_defs: list = None) -> dict:
+    subnets = subnets or []
+    tag_defs = tag_defs or []
 
+    # Index bandwidth rows by IP for O(1) lookup per device.
+    bw_by_ip = {}
+    for b in bandwidth_rows:
+        ip = (b.get("IP") or "").strip()
+        if ip:
+            bw_by_ip.setdefault(ip, []).append(b)
 
-def load_bandwidth_caps(bw_rows, log=None):
-    bandwidth_dict = {}
-    total = 0
-    for row in bw_rows:
-        ip = safe_str(row.get("IP"))
-        interface_raw = safe_str(row.get("Interface"))
-        if not ip or not interface_raw:
-            continue
-
-        allocated_bw = safe_str(row.get("Allocated BW"))
-        region = safe_str(row.get("Region"))
-        center = safe_str(row.get("Center"))
-        link_type = safe_str(row.get("Link Type"))
-        iface_desc = safe_str(row.get("Interface_description"))
-
-        speed_bps = parse_bandwidth(allocated_bw)
-        match_field, match_value = get_interface_match(interface_raw, log)
-
-        tags = []
-        if region:
-            tags.append(f"region:{sanitize_tag_value(region)}")
-        if center:
-            tags.append(f"center:{sanitize_tag_value(center)}")
-        if link_type:
-            tags.append(f"link_type:{sanitize_tag_value(link_type)}")
-        if iface_desc:
-            tags.append(f"interface_description:{iface_desc}")
-        custom_tags = row.get("customTags")
-        if isinstance(custom_tags, list):
-            for t in custom_tags:
-                ts = safe_str(t)
-                if ts:
-                    tags.append(ts)
-
-        iface_config = {
-            "match_field": match_field,
-            "match_value": match_value,
-            "in_speed": speed_bps,
-            "out_speed": speed_bps,
-            "tags": tags,
-        }
-
-        bandwidth_dict.setdefault(ip, []).append(iface_config)
-        total += 1
-
-    return bandwidth_dict, total
-
-
-def convert_to_collector_configs(device_rows, bw_rows, init_config=None, log=None):
-    """
-    Main conversion: device rows (each with its OWN credential fields) +
-    bandwidth rows -> per-collector-region YAML-ready objects.
-
-    Returns a dict with keys: groups, skipped_devices,
-    missing_region_devices, missing_creds_devices, orphaned_bw_ips,
-    total_bw_interfaces -- same shape as the JS convertToCollectorConfigs.
-    """
-    if init_config is None:
-        init_config = {
-            "loader": "core",
-            "use_device_id_as_hostname": True,
-            "min_collection_interval": 100,
-            "oid_batch_size": 5,
-            "timeout": 5,
-            "ping": {"enabled": True, "count": 4, "interval": 250, "timeout": 3000},
-        }
-    if log is None:
-        log = lambda msg: None
-
-    bandwidth_dict, total_bw_interfaces = load_bandwidth_caps(bw_rows, log)
-    used_bw_ips = set()
-
-    grouped_devices = {}
-    stats_tracker = {}
+    device_ips = set()
+    groups = {}          # group_key -> {"region": display name, "devices": [...]}
+    group_stats = {}
     skipped_devices = 0
     missing_region_devices = []
     missing_creds_devices = []
+    used_bw_ips = set()
 
-    for row in device_rows:
-        ip = safe_str(row.get("IP")) or safe_str(row.get("Device IP"))
+    for device in devices:
+        ip = (device.get("IP") or "").strip()
         if not ip:
             skipped_devices += 1
             continue
+        device_ips.add(ip)
 
-        collector_region = safe_str(row.get("Collector Region"))
-        if not collector_region:
-            missing_region_devices.append({"ip": ip, "device": safe_str(row.get("Device"))})
+        region = (device.get("Collector Region") or "").strip()
+        if not region:
+            missing_region_devices.append({"ip": ip, "device": device.get("Device", "")})
             continue
 
-        operating_region = safe_str(row.get("Operating Region"))
-        config_type = safe_str(row.get("Config Type")) or "SNMP"
-        geolocation = safe_str(row.get("geolocation"))
-        region = safe_str(row.get("Region"))
-        center = safe_str(row.get("Center"))
-        device_class = safe_str(row.get("Device Class"))
-        device_category = safe_str(row.get("Device Category"))
-        device_type = safe_str(row.get("Device Type"))
-        device_name = safe_str(row.get("Device"))
+        group_key = normalize_group_key(region)
+        groups.setdefault(group_key, {"region": region, "devices": []})
+        gs = group_stats.setdefault(group_key, {
+            "snmp_count": 0, "icmp_only_count": 0, "missing_creds_count": 0,
+            "bw_devices": 0, "bw_interfaces": 0,
+        })
 
-        country_code = COUNTRY_CODES.get(operating_region) or COUNTRY_CODES.get(region) or "XX"
-        group_name = sanitize_filename(collector_region)
+        forced_icmp = should_be_icmp_only(device)
+        full_creds = has_full_creds(device)
 
-        if group_name not in stats_tracker:
-            stats_tracker[group_name] = {
-                "snmp_count": 0, "icmp_only_count": 0, "missing_creds_count": 0,
-                "bw_devices": 0, "bw_interfaces": 0,
-            }
+        subnet_match = None
+        for s in subnets:
+            cidr = (s.get("CIDR") or "").strip()
+            if not cidr:
+                continue
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+                if ipaddress.ip_address(ip) in net:
+                    if subnet_match is None or net.prefixlen > ipaddress.ip_network(subnet_match["CIDR"], strict=False).prefixlen:
+                        subnet_match = s
+            except ValueError:
+                continue
 
-        tags = []
-        if collector_region:
-            tags.append(f"collector_region:{sanitize_tag_value(collector_region)}")
-        if operating_region:
-            tags.append(f"operating_region:{sanitize_tag_value(operating_region)}")
-        if config_type:
-            tags.append(f"config_type:{sanitize_tag_value(config_type)}")
-        if geolocation:
-            tags.append(f"geolocation:{sanitize_tag_value(geolocation)}")
-        if region:
-            tags.append(f"region:{sanitize_tag_value(region)}")
-        if center:
-            tags.append(f"center:{sanitize_tag_value(center)}")
-        if device_class:
-            tags.append(f"device_class:{sanitize_tag_value(device_class)}")
-        if device_category:
-            tags.append(f"device_category:{sanitize_tag_value(device_category)}")
-        if device_type:
-            tags.append(f"device_type:{sanitize_tag_value(device_type)}")
-        if device_name:
-            tags.append(f"device_name:{sanitize_tag_value(device_name)}")
-        custom_tags = row.get("customTags")
-        if isinstance(custom_tags, list):
-            for t in custom_tags:
-                ts = safe_str(t)
-                if ts:
-                    tags.append(ts)
-        tags.append(f"ip_address:{ip}")
-        tags.append(f"country_code:{country_code}")
+        resolved_tags = resolve_tags_for_record(device, tag_defs, subnet_match)
 
-        if should_be_icmp_only(device_class, config_type):
-            device_config = {"network_address": f"{ip}/32", "tags": tags}
-            stats_tracker[group_name]["icmp_only_count"] += 1
-        else:
-            creds_ok = has_complete_credentials(row)
-            if not creds_ok:
-                missing_creds_devices.append({"ip": ip, "device": device_name, "region": collector_region})
-                stats_tracker[group_name]["missing_creds_count"] += 1
-            device_config = {
-                "ip_address": ip,
-                "snmp_version": 3,
-                "user": safe_str(row.get("snmpUser")),
-                "authProtocol": safe_str(row.get("authProtocol")) or "SHA",
-                "authKey": safe_str(row.get("authKey")),
-                "privProtocol": safe_str(row.get("privProtocol")) or "AES",
-                "privKey": safe_str(row.get("privKey")),
-                "tags": tags,
-            }
-            if ip in bandwidth_dict:
-                device_config["interface_configs"] = bandwidth_dict[ip]
-                used_bw_ips.add(ip)
-                stats_tracker[group_name]["bw_devices"] += 1
-                stats_tracker[group_name]["bw_interfaces"] += len(bandwidth_dict[ip])
-            stats_tracker[group_name]["snmp_count"] += 1
-
-        grouped_devices.setdefault(group_name, []).append(device_config)
-
-    orphaned_bw_ips = [ip for ip in bandwidth_dict if ip not in used_bw_ips]
-
-    groups = {}
-    for group_name, devices in grouped_devices.items():
-        groups[group_name] = {
-            "config": {"init_config": init_config, "instances": devices},
-            "stats": stats_tracker[group_name],
-            "device_count": len(devices),
+        entry = {
+            "ip": ip,
+            "device": device.get("Device", ""),
         }
+        if resolved_tags:
+            entry["tags"] = resolved_tags
+
+        if forced_icmp:
+            entry["network_address"] = f"{ip}/32"
+            entry["mode"] = "icmp"
+            gs["icmp_only_count"] += 1
+        else:
+            entry["snmpUser"] = device.get("snmpUser", "")
+            entry["authProtocol"] = device.get("authProtocol", "")
+            entry["authKey"] = device.get("authKey", "")
+            entry["privProtocol"] = device.get("privProtocol", "")
+            entry["privKey"] = device.get("privKey", "")
+            gs["snmp_count"] += 1
+            if not full_creds:
+                gs["missing_creds_count"] += 1
+                missing_creds_devices.append({"ip": ip, "device": device.get("Device", ""), "region": region})
+
+        bw_rows_for_ip = bw_by_ip.get(ip, [])
+        if bw_rows_for_ip:
+            used_bw_ips.add(ip)
+            gs["bw_devices"] += 1
+            interfaces = []
+            for b in bw_rows_for_ip:
+                gs["bw_interfaces"] += 1
+                iface_match = _interface_match(b.get("Interface", ""))
+                bps = _parse_bw_to_bps(b.get("Allocated BW", ""))
+                interfaces.append({
+                    **iface_match,
+                    "allocated_bw_bps": bps,
+                    "interface_description": b.get("Interface_description", ""),
+                })
+            entry["interface_configs"] = interfaces
+
+        groups[group_key]["devices"].append(entry)
+
+    orphaned_bw_ips = sorted({ip for ip in bw_by_ip if ip not in device_ips})
+
+    files = {}
+    for group_key, group_data in groups.items():
+        config = {
+            "init_config": {},
+            "instances": group_data["devices"],
+        }
+        files[f"{group_key}.yaml"] = config
+
+    snmp_total = sum(g["snmp_count"] for g in group_stats.values())
+    icmp_total = sum(g["icmp_only_count"] for g in group_stats.values())
 
     return {
-        "groups": groups,
-        "skipped_devices": skipped_devices,
-        "missing_region_devices": missing_region_devices,
-        "missing_creds_devices": missing_creds_devices,
-        "orphaned_bw_ips": orphaned_bw_ips,
-        "total_bw_interfaces": total_bw_interfaces,
+        "files": files,  # group_key.yaml -> config dict (caller runs yamldump)
+        "groupStats": group_stats,
+        "skippedDevices": skipped_devices,
+        "missingRegionDevices": missing_region_devices,
+        "missingCredsDevices": missing_creds_devices,
+        "orphanedBwIps": orphaned_bw_ips,
+        "totalBwInterfaces": sum(g["bw_interfaces"] for g in group_stats.values()),
+        "snmpTotal": snmp_total,
+        "icmpTotal": icmp_total,
+        "summary": f"{len(groups)} region(s), {snmp_total} SNMP / {icmp_total} ICMP devices",
     }

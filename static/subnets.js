@@ -1,68 +1,68 @@
 // ============================================================================
-// BANDWIDTH CAPPING VIEW
+// SUBNETS VIEW
 // ============================================================================
 
-const Bandwidth = (() => {
+const Subnets = (() => {
   const FIELDS = [
-    { key: 'IP', label: 'IP', required: true },
-    { key: 'Interface', label: 'Interface', required: true },
-    { key: 'Allocated BW', label: 'Allocated BW' },
-    { key: 'Region', label: 'Region' },
-    { key: 'Center', label: 'Center' },
-    { key: 'Link Type', label: 'Link Type' },
-    { key: 'Interface_description', label: 'Interface Description' },
+    { key: 'CIDR', label: 'CIDR', required: true, placeholder: 'e.g. 10.1.1.0/24' },
+    { key: 'Description', label: 'Description' },
   ];
+
+  function isValidCidr(value) {
+    // Lightweight client-side sanity check; the server is the source of
+    // truth for actual matching at generate time.
+    return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/.test((value || '').trim());
+  }
 
   async function render() {
     const content = document.getElementById('content');
-    const mode = state.viewMode.bandwidth;
+    const mode = state.viewMode.subnets;
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
         <div class="flex gap-8 wrap">
-          <button class="btn btn-primary" id="btn-add-bw">+ Add Row</button>
-          <button class="btn" id="btn-import-bw">Import from Excel</button>
-          <button class="btn" id="btn-export-bw">Export to Excel</button>
+          <button class="btn btn-primary" id="btn-add-subnet">+ Add Subnet</button>
+          <button class="btn" id="btn-import-subnets">Import from Excel</button>
+          <button class="btn" id="btn-export-subnets">Export to Excel</button>
         </div>
         <div class="flex gap-12 items-center">
-          <div class="text-dim">${state.bandwidth.length} row(s)</div>
+          <div class="text-dim">${state.subnets.length} subnet(s)</div>
           <div class="view-toggle">
             <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
             <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
           </div>
         </div>
       </div>
-      <div id="bw-body"></div>
+      <div class="banner banner-info mb-16">
+        <span>&#9432;</span>
+        <div class="banner-content">Devices inside a subnet's CIDR range automatically inherit that subnet's tags for any tag value they don't already set themselves.</div>
+      </div>
+      <div id="subnets-body"></div>
     `;
     renderBody();
-    document.getElementById('btn-add-bw').addEventListener('click', () => openForm(null));
-    document.getElementById('btn-import-bw').addEventListener('click', () => openImportDialog());
-    document.getElementById('btn-export-bw').addEventListener('click', handleExport);
+    document.getElementById('btn-add-subnet').addEventListener('click', () => openForm(null));
+    document.getElementById('btn-import-subnets').addEventListener('click', () => openImportDialog());
+    document.getElementById('btn-export-subnets').addEventListener('click', handleExport);
     content.querySelectorAll('.view-toggle button').forEach(btn => {
-      btn.addEventListener('click', () => { state.viewMode.bandwidth = btn.dataset.mode; render(); });
+      btn.addEventListener('click', () => { state.viewMode.subnets = btn.dataset.mode; render(); });
     });
   }
 
   function renderBody() {
-    const body = document.getElementById('bw-body');
-    if (state.bandwidth.length === 0) {
-      body.innerHTML = emptyState({ title: 'No bandwidth caps yet', sub: 'Add a row manually or import a spreadsheet.' });
+    const body = document.getElementById('subnets-body');
+    if (state.subnets.length === 0) {
+      body.innerHTML = emptyState({ title: 'No subnets yet', sub: 'Define a CIDR range to start tagging devices by network automatically.' });
       return;
     }
-    body.innerHTML = state.viewMode.bandwidth === 'card' ? renderCards() : `<div class="panel"><div class="table-wrap">${renderTable()}</div></div>`;
+    body.innerHTML = state.viewMode.subnets === 'card' ? renderCards() : `<div class="panel"><div class="table-wrap">${renderTable()}</div></div>`;
     wireRowActions();
   }
 
   function renderTable() {
-    const rows = state.bandwidth.map(b => `
-      <tr data-id="${escapeHtml(b.id)}">
-        <td class="mono">${escapeHtml(b.IP)}</td>
-        <td class="mono">${escapeHtml(b.Interface)}</td>
-        <td>${escapeHtml(b['Allocated BW'])}</td>
-        <td>${escapeHtml(b.Region)}</td>
-        <td>${escapeHtml(b.Center)}</td>
-        <td>${escapeHtml(b['Link Type'])}</td>
-        <td>${escapeHtml(b.Interface_description)}</td>
-        <td>${TagFields.renderBadges('bandwidth', b.tags) || '<span class="text-faint">&mdash;</span>'}</td>
+    const rows = state.subnets.map(s => `
+      <tr data-id="${escapeHtml(s.id)}">
+        <td class="mono">${escapeHtml(s.CIDR)}</td>
+        <td>${escapeHtml(s.Description)}</td>
+        <td>${TagFields.renderBadges('subnets', s.tags) || '<span class="text-faint">&mdash;</span>'}</td>
         <td>
           <button class="btn btn-sm" data-act="edit">Edit</button>
           <button class="btn btn-sm btn-danger" data-act="delete">Delete</button>
@@ -71,29 +71,22 @@ const Bandwidth = (() => {
     `).join('');
     return `
       <table>
-        <thead><tr>
-          <th>IP</th><th>Interface</th><th>Allocated BW</th><th>Region</th>
-          <th>Center</th><th>Link Type</th><th>Interface Description</th><th>Tags</th><th></th>
-        </tr></thead>
+        <thead><tr><th>CIDR</th><th>Description</th><th>Tags</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
   }
 
   function renderCards() {
-    const cards = state.bandwidth.map(b => `
-      <div class="data-card" data-id="${escapeHtml(b.id)}">
+    const cards = state.subnets.map(s => `
+      <div class="data-card" data-id="${escapeHtml(s.id)}">
         <div class="data-card-header">
           <div>
-            <div class="data-card-title">${escapeHtml(b.Interface)}</div>
-            <div class="data-card-sub">${escapeHtml(b.IP)}</div>
+            <div class="data-card-title">${escapeHtml(s.CIDR)}</div>
+            <div class="data-card-sub">${escapeHtml(s.Description || '')}</div>
           </div>
-          ${b['Allocated BW'] ? `<span class="badge badge-neutral">${escapeHtml(b['Allocated BW'])}</span>` : ''}
         </div>
-        <div class="data-card-meta">
-          ${b['Link Type'] ? `<span class="badge badge-neutral">${escapeHtml(b['Link Type'])}</span>` : ''}
-          ${TagFields.renderBadges('bandwidth', b.tags)}
-        </div>
+        <div class="data-card-meta">${TagFields.renderBadges('subnets', s.tags)}</div>
         <div class="data-card-actions">
           <button class="btn btn-sm" data-act="edit">Edit</button>
           <button class="btn btn-sm btn-danger" data-act="delete">Delete</button>
@@ -104,21 +97,21 @@ const Bandwidth = (() => {
   }
 
   function wireRowActions() {
-    document.querySelectorAll('#bw-body [data-id]').forEach(el => {
+    document.querySelectorAll('#subnets-body [data-id]').forEach(el => {
       const id = el.dataset.id;
-      const row = state.bandwidth.find(b => String(b.id) === String(id));
-      el.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); openForm(row); }));
-      el.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); handleDelete(row); }));
+      const s = state.subnets.find(x => String(x.id) === String(id));
+      el.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); openForm(s); }));
+      el.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); handleDelete(s); }));
     });
   }
 
-  async function handleDelete(row) {
-    const ok = await confirmDialog(`Delete bandwidth row ${row.IP} / ${row.Interface}? This cannot be undone.`);
+  async function handleDelete(subnet) {
+    const ok = await confirmDialog(`Delete subnet ${subnet.CIDR}? Devices in this range will no longer inherit its tags. This cannot be undone.`);
     if (!ok) return;
     try {
-      await Api.deleteBandwidth(row.id);
-      state.bandwidth = state.bandwidth.filter(b => b.id !== row.id);
-      toast('Row deleted', 'success');
+      await Api.deleteSubnet(subnet.id);
+      state.subnets = state.subnets.filter(s => s.id !== subnet.id);
+      toast('Subnet deleted', 'success');
       render();
       refreshCounts();
     } catch (e) {
@@ -126,21 +119,21 @@ const Bandwidth = (() => {
     }
   }
 
-  function openForm(row) {
-    const isEdit = !!row;
-    const b = row || {};
+  function openForm(subnet) {
+    const isEdit = !!subnet;
+    const s = subnet || {};
     const overlay = openModal(`
       <div class="modal-header">
-        <h3>${isEdit ? 'Edit Bandwidth Row' : 'Add Bandwidth Row'}</h3>
+        <h3>${isEdit ? 'Edit Subnet' : 'Add Subnet'}</h3>
         <button class="modal-close" data-act="close">&times;</button>
       </div>
       <div class="modal-body">
-        <form id="bw-form">
+        <form id="subnet-form">
           <div class="form-grid mb-16">
             ${FIELDS.map(f => `
               <div class="field">
                 <label>${escapeHtml(f.label)}${f.required ? '<span class="req">*</span>' : ''}</label>
-                <input type="text" name="${f.key}" value="${escapeHtml(b[f.key] || '')}" ${f.required ? 'required' : ''}>
+                <input type="text" name="${f.key}" value="${escapeHtml(s[f.key] || '')}" placeholder="${escapeHtml(f.placeholder || '')}" ${f.required ? 'required' : ''}>
               </div>
             `).join('')}
           </div>
@@ -148,35 +141,40 @@ const Bandwidth = (() => {
             <h2 style="font-size:13px;color:var(--text-dim);">Tags</h2>
           </div>
           <div class="form-grid">
-            ${TagFields.renderFormFields('bandwidth', b.tags)}
+            ${TagFields.renderFormFields('subnets', s.tags)}
           </div>
         </form>
       </div>
       <div class="modal-footer">
         ${isEdit ? `<button class="btn btn-danger" data-act="delete" style="margin-right:auto;">Delete</button>` : ''}
         <button class="btn" data-act="close">Cancel</button>
-        <button class="btn btn-primary" data-act="save">${isEdit ? 'Save Changes' : 'Add Row'}</button>
+        <button class="btn btn-primary" data-act="save">${isEdit ? 'Save Changes' : 'Add Subnet'}</button>
       </div>
     `);
     overlay.querySelectorAll('[data-act="close"]').forEach(el => el.addEventListener('click', () => closeModal(overlay)));
     if (isEdit) {
-      overlay.querySelector('[data-act="delete"]').addEventListener('click', async () => { closeModal(overlay); await handleDelete(b); });
+      overlay.querySelector('[data-act="delete"]').addEventListener('click', async () => { closeModal(overlay); await handleDelete(s); });
     }
     overlay.querySelector('[data-act="save"]').addEventListener('click', async () => {
-      const form = overlay.querySelector('#bw-form');
+      const form = overlay.querySelector('#subnet-form');
       if (!form.reportValidity()) return;
       const fd = new FormData(form);
-      const payload = isEdit ? { id: b.id } : {};
+      const cidrValue = fd.get('CIDR');
+      if (!isValidCidr(cidrValue)) {
+        toast('CIDR must look like 10.1.1.0/24', 'warn');
+        return;
+      }
+      const payload = isEdit ? { id: s.id } : {};
       for (const [k, v] of fd.entries()) {
         if (!k.startsWith('tag__')) payload[k] = v;
       }
       payload.tags = TagFields.readFormFields(fd);
       try {
-        const saved = await Api.saveBandwidth(payload);
-        const newRow = saved.row || saved;
-        if (isEdit) state.bandwidth = state.bandwidth.map(r => r.id === b.id ? newRow : r);
-        else state.bandwidth.push(newRow);
-        toast(isEdit ? 'Row updated' : 'Row added', 'success');
+        const saved = await Api.saveSubnet(payload);
+        const newSubnet = saved.subnet || saved;
+        if (isEdit) state.subnets = state.subnets.map(x => x.id === s.id ? newSubnet : x);
+        else state.subnets.push(newSubnet);
+        toast(isEdit ? 'Subnet updated' : 'Subnet added', 'success');
         closeModal(overlay);
         render();
         refreshCounts();
@@ -187,21 +185,22 @@ const Bandwidth = (() => {
   }
 
   function handleExport() {
-    downloadUrl(Api.exportBandwidthUrl(), 'bandwidth_export.xlsx')
-      .then(() => toast('Bandwidth caps exported', 'success'))
+    downloadUrl(Api.exportSubnetsUrl(), 'subnets_export.xlsx')
+      .then(() => toast('Subnets exported', 'success'))
       .catch(e => reportError(e, 'Export failed'));
   }
 
   function openImportDialog() {
     const overlay = openModal(`
       <div class="modal-header">
-        <h3>Import Bandwidth Caps from Excel</h3>
+        <h3>Import Subnets from Excel</h3>
         <button class="modal-close" data-act="close">&times;</button>
       </div>
       <div class="modal-body">
         <div class="import-dialog-section">
           <h4>1. Choose file</h4>
           <input type="file" id="import-file" accept=".xlsx,.xls">
+          <div class="field-hint" style="margin-top:6px;">Tip: use "Export to Excel" first to get a template with the right columns, including any custom tags.</div>
         </div>
         <div class="import-dialog-section" id="import-sheet-section" style="display:none;">
           <h4>2. Choose sheet</h4>
@@ -236,7 +235,7 @@ const Bandwidth = (() => {
       const buf = await file.arrayBuffer();
       workbook = XLSX.read(buf, { type: 'array' });
       const names = workbook.SheetNames;
-      const preferred = names.find(n => n.toLowerCase() === 'bandwidth_capping') || names[0];
+      const preferred = names.find(n => n.toLowerCase() === 'subnets') || names[0];
       sheetSelect.innerHTML = names.map(n => `<option value="${escapeHtml(n)}"${n === preferred ? ' selected' : ''}>${escapeHtml(n)}</option>`).join('');
       sheetSection.style.display = '';
       importBtn.disabled = false;
@@ -256,15 +255,17 @@ const Bandwidth = (() => {
       const sheet = workbook.Sheets[sheetSelect.value];
       const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
       const mode = overlay.querySelector('input[name="import-mode"]:checked').value;
-      const bwTagDefs = TagFields.defsForScope('bandwidth');
+      const subnetTagDefs = TagFields.defsForScope('subnets');
 
       const records = [];
+      let skippedInvalidCidr = 0;
       for (const r of rows) {
-        if (!String(r['IP'] || '').trim() || !String(r['Interface'] || '').trim()) continue;
-        const rec = {};
-        for (const f of FIELDS) rec[f.key] = String(r[f.key] || '');
+        const cidr = String(r['CIDR'] || '').trim();
+        if (!cidr) continue;
+        if (!isValidCidr(cidr)) { skippedInvalidCidr++; continue; }
+        const rec = { CIDR: cidr, Description: String(r['Description'] || '') };
         rec.tags = {};
-        for (const td of bwTagDefs) {
+        for (const td of subnetTagDefs) {
           const v = r[td.name];
           if (v !== undefined && v !== '') rec.tags[td.id] = String(v);
         }
@@ -274,9 +275,12 @@ const Bandwidth = (() => {
       try {
         importBtn.disabled = true;
         importBtn.textContent = 'Importing\u2026';
-        await Api.importBandwidth(records, mode);
-        await TagFields.registerNewValuesFromImport('bandwidth', records);
-        toast(`Imported ${records.length} row(s) (${mode})`, 'success');
+        await Api.importSubnets(records, mode);
+        await TagFields.registerNewValuesFromImport('subnets', records);
+        const msg = skippedInvalidCidr > 0
+          ? `Imported ${records.length} subnet(s) (${mode}) \u2014 skipped ${skippedInvalidCidr} row(s) with an invalid CIDR`
+          : `Imported ${records.length} subnet(s) (${mode})`;
+        toast(msg, skippedInvalidCidr > 0 ? 'warn' : 'success');
         closeModal(overlay);
         await reloadAllData();
         render();

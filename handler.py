@@ -2,316 +2,451 @@
 HTTP request handler: JSON REST API + static file serving.
 
 Single ThreadingHTTPServer process. One person runs this on an always-on
-machine; everyone else just opens a browser to http://<that machine>:<port>.
+machine; everyone else opens a browser to http://<that machine>:<port>.
+
+Request/response shapes (devices and bandwidth mirror each other):
+  GET    /api/devices                -> {devices: [...]}
+  POST   /api/devices                 body {device: {...}, _actor}      -> {device: {...with id...}}
+  DELETE /api/devices/{id}?_actor=... -> {deleted: id}
+  POST   /api/devices/import          body {devices: [...], mode, _actor} -> {imported: N, mode}
+
+  GET    /api/bandwidth               -> {rows: [...]}
+  POST   /api/bandwidth               body {row: {...}, _actor}        -> {row: {...with id...}}
+  DELETE /api/bandwidth/{id}?_actor=... -> {deleted: id}
+  POST   /api/bandwidth/import        body {rows: [...], mode, _actor} -> {imported: N, mode}
+
+  GET    /api/subnets                 -> {subnets: [...]}
+  POST   /api/subnets                 body {subnet: {...}, _actor}     -> {subnet: {...with id...}}
+  DELETE /api/subnets/{id}?_actor=... -> {deleted: id}
+  POST   /api/subnets/import          body {subnets: [...], mode, _actor} -> {imported: N, mode}
+
+  GET    /api/lists                                  -> {lists: {...}}
+  POST   /api/lists/{name}            body {items: [...], _actor}      -> {items: [...]}
+  GET    /api/lists/{name}/usage?value=X              -> {count: N}
+
+  GET    /api/tags                                    -> {tagDefs: [...]}
+  POST   /api/tags                    body {tagDef: {...}, _actor}     -> {tagDef: {...with id...}}
+  DELETE /api/tags/{id}?_actor=...                     -> {deleted: id} | 409 {error, dependents: N}
+  GET    /api/tags/{id}/usage?value=X                  -> {count: N}   (value omitted = any non-empty)
+
+  GET    /api/audit?limit=N           -> {entries: [...]}
+  GET    /api/history?limit=N         -> {entries: [...]}
+  GET    /api/history/{id}            -> {id, ts, actor, summary, files}
+  POST   /api/generate                body {_actor}                    -> {files, groupStats, ...}
+  GET    /api/meta                                    -> {deviceCount, bandwidthCount, subnetCount, lastSavedAt, lastSavedBy}
+  GET    /api/export/devices.xlsx                     -> binary xlsx (template-compatible with import)
+  GET    /api/export/bandwidth.xlsx                    -> binary xlsx
+
+All write endpoints accept/return a dependency-checked-delete contract:
+deleting something with active dependents returns HTTP 409 with
+{error: "...", dependents: N} instead of failing silently or succeeding
+destructively; the caller (frontend) is expected to surface this and
+require an explicit force=true to proceed, EXCEPT for tag DEFINITIONS
+and LIST ITEMS, where delete always succeeds but the response includes
+a `warning` field with the dependent count so the frontend can confirm
+before calling (frontend already does its own usage check + confirm
+dialog before calling delete in the merge-tags-flow case). Devices/
+bandwidth/subnets rows themselves have no cross-table dependents in this
+schema, so their DELETE is unconditional.
 """
-
 import json
-import mimetypes
-import os
 import re
-import uuid
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
-import logic
 import storage
+import logic
 import yamldump
+import xlsxwriter
 
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:16]
+STATIC_DIR = None  # set by server.py before serving
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SNMPYAMLGenerator/1.0"
+    server_version = "ConfigForge/1.0"
 
-    # Quiet the default request logging format a bit
-    def log_message(self, fmt, *args):
-        try:
-            print("%s - %s" % (self.address_string(), fmt % args))
-        except Exception:
-            pass
-
-    # ---- helpers ----------------------------------------------------
-
-    def _send_json(self, status: int, payload):
-        body = json.dumps(payload).encode("utf-8")
+    # -------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-    def _send_error_json(self, status: int, message: str):
-        self._send_json(status, {"error": message})
+    def _send_binary(self, data: bytes, content_type: str, filename: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-    def _read_json_body(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
         raw = self.rfile.read(length)
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as e:
-            raise ValueError(f"invalid JSON body: {e}")
+        if not raw:
+            return {}
+        return json.loads(raw)
 
-    def _actor(self, body=None):
-        """Editor-name attribution, same model as the old prompt()-once-per-session."""
-        if body and isinstance(body, dict) and body.get("_actor"):
-            return str(body["_actor"])[:120]
-        return self.headers.get("X-Editor-Name", "unknown")
+    def log_message(self, fmt, *args):
+        pass  # quiet; rely on audit log instead
 
-    # ---- static file serving ----------------------------------------
-
-    def _serve_static(self, path: str):
-        if path == "/" or path == "":
-            path = "/index.html"
-        # Prevent path traversal outside STATIC_DIR
-        rel = path.lstrip("/")
-        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
-        if not full.startswith(STATIC_DIR):
-            self.send_error(403, "Forbidden")
-            return
-        if not os.path.isfile(full):
-            self.send_error(404, "Not found")
-            return
-        ctype, _ = mimetypes.guess_type(full)
-        if not ctype:
-            ctype = "application/octet-stream"
-        with open(full, "rb") as f:
-            data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    # ---- routing ------------------------------------------------------
-
+    # -------------------------------------------------------------------
+    # GET
+    # -------------------------------------------------------------------
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
+
         try:
             if path == "/api/devices":
-                return self._send_json(200, {"devices": storage.list_devices()})
+                return self._send_json({"devices": storage.list_devices()})
             if path == "/api/bandwidth":
-                return self._send_json(200, {"rows": storage.list_bandwidth_caps()})
+                return self._send_json({"rows": storage.list_bandwidth()})
+            if path == "/api/subnets":
+                return self._send_json({"subnets": storage.list_subnets()})
             if path == "/api/lists":
-                return self._send_json(200, {"lists": storage.get_all_lists()})
+                return self._send_json({"lists": storage.get_lists()})
+            if path == "/api/tags":
+                return self._send_json({"tagDefs": storage.list_tag_defs()})
+
             m = re.match(r"^/api/lists/([^/]+)/usage$", path)
             if m:
-                list_name = m.group(1)
-                value = (qs.get("value") or [""])[0]
-                count = storage.count_list_value_usage(list_name, value)
-                return self._send_json(200, {"listName": list_name, "value": value, "count": count})
-            if path == "/api/audit":
-                limit = int((qs.get("limit") or [500])[0])
-                return self._send_json(200, {"entries": storage.list_audit_log(limit)})
-            if path == "/api/history":
-                limit = int((qs.get("limit") or [100])[0])
-                return self._send_json(200, {"entries": storage.list_yaml_history(limit)})
-            m = re.match(r"^/api/history/(\d+)$", path)
+                value = qs.get("value", [""])[0]
+                count = storage.list_usage_count(m.group(1), value)
+                return self._send_json({"count": count})
+
+            m = re.match(r"^/api/tags/([^/]+)/usage$", path)
             if m:
-                entry = storage.get_yaml_history_entry(int(m.group(1)))
-                if entry is None:
-                    return self._send_error_json(404, "history entry not found")
-                return self._send_json(200, entry)
+                value = qs.get("value", [None])[0]
+                if value is not None:
+                    count = storage.tag_value_usage_count(m.group(1), value)
+                else:
+                    count = storage.tag_def_usage_count(m.group(1))
+                return self._send_json({"count": count})
+
+            if path == "/api/audit":
+                limit = int(qs.get("limit", ["100"])[0])
+                return self._send_json({"entries": storage.list_audit(limit)})
+
+            if path == "/api/history":
+                limit = int(qs.get("limit", ["50"])[0])
+                return self._send_json({"entries": storage.list_history(limit)})
+
+            m = re.match(r"^/api/history/([^/]+)$", path)
+            if m:
+                entry = storage.get_history_entry(m.group(1))
+                if not entry:
+                    return self._send_json({"error": "not found"}, 404)
+                return self._send_json(entry)
+
             if path == "/api/meta":
-                devices = storage.list_devices()
-                bw = storage.list_bandwidth_caps()
-                last_saved_at = storage.get_meta("last_saved_at")
-                last_saved_by = storage.get_meta("last_saved_by")
-                return self._send_json(200, {
-                    "deviceCount": len(devices),
-                    "bandwidthCount": len(bw),
-                    "lastSavedAt": last_saved_at,
-                    "lastSavedBy": last_saved_by,
-                })
+                return self._send_json(storage.get_meta())
+
+            if path == "/api/export/devices.xlsx":
+                return self._export_devices_xlsx()
+            if path == "/api/export/bandwidth.xlsx":
+                return self._export_bandwidth_xlsx()
+            if path == "/api/export/subnets.xlsx":
+                return self._export_subnets_xlsx()
+
             return self._serve_static(path)
         except Exception as e:
-            self._send_error_json(500, str(e))
+            import traceback
+            traceback.print_exc()
+            return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
 
+    def _serve_static(self, path):
+        import os
+        if path == "/":
+            path = "/index.html"
+        full = os.path.normpath(os.path.join(STATIC_DIR, path.lstrip("/")))
+        if not full.startswith(os.path.normpath(STATIC_DIR)):
+            return self._send_json({"error": "forbidden"}, 403)
+        if not os.path.isfile(full):
+            return self._send_json({"error": "not found"}, 404)
+        with open(full, "rb") as f:
+            body = f.read()
+        ctype = "text/html"
+        if path.endswith(".js"):
+            ctype = "application/javascript"
+        elif path.endswith(".css"):
+            ctype = "text/css"
+        elif path.endswith(".svg"):
+            ctype = "image/svg+xml"
+        elif path.endswith(".png"):
+            ctype = "image/png"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # -------------------------------------------------------------------
+    # POST
+    # -------------------------------------------------------------------
     def do_POST(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = unquote(parsed.path)
+
         try:
-            body = self._read_json_body()
-        except ValueError as e:
-            return self._send_error_json(400, str(e))
+            body = self._read_json()
+        except Exception as e:
+            return self._send_json({"error": f"invalid JSON body: {e}"}, 400)
+        actor = body.get("_actor")
 
         try:
             if path == "/api/devices":
-                return self._handle_upsert_device(body)
+                return self._upsert_device(body, actor)
             if path == "/api/devices/import":
-                return self._handle_devices_import(body)
+                return self._import_rows(body, actor, scope="devices")
+
             if path == "/api/bandwidth":
-                return self._handle_upsert_bandwidth(body)
+                return self._upsert_bandwidth(body, actor)
             if path == "/api/bandwidth/import":
-                return self._handle_bandwidth_import(body)
+                return self._import_rows(body, actor, scope="bandwidth")
+
+            if path == "/api/subnets":
+                return self._upsert_subnet(body, actor)
+            if path == "/api/subnets/import":
+                return self._import_rows(body, actor, scope="subnets")
+
             m = re.match(r"^/api/lists/([^/]+)$", path)
             if m:
-                return self._handle_set_list(m.group(1), body)
-            if path == "/api/generate":
-                return self._handle_generate(body)
-            return self._send_error_json(404, "not found")
-        except ValueError as e:
-            return self._send_error_json(400, str(e))
-        except Exception as e:
-            return self._send_error_json(500, str(e))
+                return self._set_list(m.group(1), body, actor)
 
+            if path == "/api/tags":
+                return self._upsert_tag(body, actor)
+
+            if path == "/api/generate":
+                return self._generate(actor)
+
+            return self._send_json({"error": "not found"}, 404)
+        except ValueError as e:
+            return self._send_json({"error": str(e)}, 400)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()  # full traceback to the server console
+            return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
+
+    def _upsert_device(self, body, actor):
+        device = body.get("device")
+        if not isinstance(device, dict):
+            return self._send_json({"error": "'device' must be an object"}, 400)
+        is_create = not device.get("id")
+        saved = storage.upsert_device(device)
+        storage.log_audit(actor, "create_device" if is_create else "update_device",
+                           {"id": saved["id"], "ip": saved.get("IP")})
+        return self._send_json({"device": saved})
+
+    def _upsert_bandwidth(self, body, actor):
+        row = body.get("row")
+        if not isinstance(row, dict):
+            return self._send_json({"error": "'row' must be an object"}, 400)
+        is_create = not row.get("id")
+        saved = storage.upsert_bandwidth(row)
+        storage.log_audit(actor, "create_bandwidth" if is_create else "update_bandwidth",
+                           {"id": saved["id"], "ip": saved.get("IP")})
+        return self._send_json({"row": saved})
+
+    def _upsert_subnet(self, body, actor):
+        subnet = body.get("subnet")
+        if not isinstance(subnet, dict):
+            return self._send_json({"error": "'subnet' must be an object"}, 400)
+        is_create = not subnet.get("id")
+        saved = storage.upsert_subnet(subnet)
+        storage.log_audit(actor, "create_subnet" if is_create else "update_subnet",
+                           {"id": saved["id"], "cidr": saved.get("CIDR")})
+        return self._send_json({"subnet": saved})
+
+    def _import_rows(self, body, actor, scope):
+        key = {"devices": "devices", "bandwidth": "rows", "subnets": "subnets"}[scope]
+        rows = body.get(key)
+        if not isinstance(rows, list):
+            return self._send_json({"error": f"'{key}' must be a list"}, 400)
+        mode = body.get("mode", "merge")
+        if mode not in ("merge", "replace"):
+            return self._send_json({"error": "'mode' must be 'merge' or 'replace'"}, 400)
+
+        replace_fn, merge_fn = {
+            "devices": (storage.replace_all_devices, storage.merge_devices),
+            "bandwidth": (storage.replace_all_bandwidth, storage.merge_bandwidth),
+            "subnets": (storage.replace_all_subnets, storage.merge_subnets),
+        }[scope]
+
+        if mode == "replace":
+            replace_fn(rows)
+        else:
+            merge_fn(rows)
+
+        storage.log_audit(actor, f"import_{scope}", {"count": len(rows), "mode": mode})
+        return self._send_json({"imported": len(rows), "mode": mode})
+
+    def _set_list(self, list_name, body, actor):
+        if list_name not in storage.FIXED_LISTS:
+            return self._send_json({"error": f"unknown list '{list_name}'"}, 404)
+        items = body.get("items")
+        if not isinstance(items, list):
+            return self._send_json({"error": "'items' must be a list"}, 400)
+        storage.set_list(list_name, items)
+        storage.log_audit(body.get("_actor"), "update_list", {"list": list_name, "items": items})
+        return self._send_json({"items": items})
+
+    def _upsert_tag(self, body, actor):
+        tag_def = body.get("tagDef")
+        if not isinstance(tag_def, dict):
+            return self._send_json({"error": "'tagDef' must be an object"}, 400)
+        if not tag_def.get("name", "").strip():
+            return self._send_json({"error": "tag name is required"}, 400)
+        invalid_scopes = [s for s in tag_def.get("scopes", []) if s not in storage.TAG_SCOPES]
+        if invalid_scopes:
+            return self._send_json({"error": f"invalid scope(s): {invalid_scopes}"}, 400)
+        is_create = not tag_def.get("id")
+        saved = storage.upsert_tag_def(tag_def)
+        storage.log_audit(actor, "create_tag" if is_create else "update_tag",
+                           {"id": saved["id"], "name": saved.get("name")})
+        return self._send_json({"tagDef": saved})
+
+    def _generate(self, actor):
+        devices = storage.list_devices()
+        bandwidth = storage.list_bandwidth()
+        subnets = storage.list_subnets()
+        tag_defs = storage.list_tag_defs()
+
+        result = logic.convert_to_collector_configs(devices, bandwidth, subnets, tag_defs)
+
+        rendered_files = {name: yamldump.dump(config) for name, config in result["files"].items()}
+        result["files"] = rendered_files
+
+        storage.save_history(actor, result["summary"], rendered_files)
+        storage.log_audit(actor, "generate", {"summary": result["summary"]})
+        return self._send_json(result)
+
+    def _export_devices_xlsx(self):
+        data = build_devices_xlsx(storage.list_devices(), storage.list_tag_defs())
+        self._send_binary(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "devices_export.xlsx")
+
+    def _export_bandwidth_xlsx(self):
+        data = build_bandwidth_xlsx(storage.list_bandwidth(), storage.list_tag_defs())
+        self._send_binary(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "bandwidth_export.xlsx")
+
+    def _export_subnets_xlsx(self):
+        data = build_subnets_xlsx(storage.list_subnets(), storage.list_tag_defs())
+        self._send_binary(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "subnets_export.xlsx")
+
+    # -------------------------------------------------------------------
+    # DELETE
+    # -------------------------------------------------------------------
     def do_DELETE(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = unquote(parsed.path)
+        qs = parse_qs(parsed.query)
+        actor = qs.get("_actor", [None])[0]
+
         try:
             m = re.match(r"^/api/devices/([^/]+)$", path)
             if m:
-                device_id = m.group(1)
-                actor = self.headers.get("X-Editor-Name", "unknown")
-                storage.delete_device(device_id)
-                storage.log_action(actor, "device.delete", {"id": device_id})
-                return self._send_json(200, {"deleted": device_id})
+                storage.delete_device(m.group(1))
+                storage.log_audit(actor, "delete_device", {"id": m.group(1)})
+                return self._send_json({"deleted": m.group(1)})
+
             m = re.match(r"^/api/bandwidth/([^/]+)$", path)
             if m:
-                row_id = m.group(1)
-                actor = self.headers.get("X-Editor-Name", "unknown")
-                storage.delete_bandwidth_cap(row_id)
-                storage.log_action(actor, "bandwidth.delete", {"id": row_id})
-                return self._send_json(200, {"deleted": row_id})
-            return self._send_error_json(404, "not found")
+                storage.delete_bandwidth(m.group(1))
+                storage.log_audit(actor, "delete_bandwidth", {"id": m.group(1)})
+                return self._send_json({"deleted": m.group(1)})
+
+            m = re.match(r"^/api/subnets/([^/]+)$", path)
+            if m:
+                storage.delete_subnet(m.group(1))
+                storage.log_audit(actor, "delete_subnet", {"id": m.group(1)})
+                return self._send_json({"deleted": m.group(1)})
+
+            m = re.match(r"^/api/tags/([^/]+)$", path)
+            if m:
+                tag_id = m.group(1)
+                force = qs.get("force", ["false"])[0] == "true"
+                dependents = storage.tag_def_usage_count(tag_id)
+                if dependents > 0 and not force:
+                    return self._send_json(
+                        {"error": "tag is in use", "dependents": dependents}, 409
+                    )
+                storage.delete_tag_def(tag_id)
+                storage.log_audit(actor, "delete_tag", {"id": tag_id, "dependents_forced": dependents if force else 0})
+                return self._send_json({"deleted": tag_id})
+
+            return self._send_json({"error": "not found"}, 404)
         except Exception as e:
-            return self._send_error_json(500, str(e))
+            import traceback
+            traceback.print_exc()
+            return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
 
-    # ---- handlers -----------------------------------------------------
 
-    def _handle_upsert_device(self, body):
-        device = body.get("device")
-        if not device or not isinstance(device, dict):
-            raise ValueError("missing 'device' object in request body")
-        is_new = not device.get("id")
-        if is_new:
-            device["id"] = _new_id()
-        storage.upsert_device(device)
+# ---------------------------------------------------------------------------
+# Excel export (template-compatible with the import flow)
+# ---------------------------------------------------------------------------
+def build_devices_xlsx(devices: list, tag_defs: list) -> bytes:
+    fixed_cols = ["IP", "Device", "Collector Region", "Operating Region", "Config Type",
+                  "geolocation", "Region", "Center", "Device Class", "Device Category",
+                  "Device Type", "Remarks",
+                  "snmpUser", "authProtocol", "authKey", "privProtocol", "privKey"]
+    device_tag_defs = [td for td in tag_defs if "devices" in td.get("scopes", [])]
+    tag_cols = [td["name"] for td in device_tag_defs]
+    headers = fixed_cols + tag_cols
 
-        for list_name, field in (
-            ("collectorRegions", "Collector Region"),
-            ("deviceClasses", "Device Class"),
-            ("deviceCategories", "Device Category"),
-            ("deviceTypes", "Device Type"),
-        ):
-            storage.add_to_list_if_missing(list_name, device.get(field, ""))
+    rows = []
+    for d in devices:
+        row = [d.get(c, "") for c in fixed_cols]
+        for td in device_tag_defs:
+            row.append((d.get("tags") or {}).get(td["id"], ""))
+        rows.append(row)
 
-        actor = self._actor(body)
-        storage.log_action(actor, "device.create" if is_new else "device.update",
-                            {"id": device["id"], "ip": device.get("IP", "")})
-        return self._send_json(200, {"device": device})
+    return xlsxwriter.write_xlsx("devices", headers, rows)
 
-    def _handle_devices_import(self, body):
-        devices = body.get("devices")
-        mode = body.get("mode", "merge")
-        if not isinstance(devices, list):
-            raise ValueError("'devices' must be a list")
-        for d in devices:
-            if not d.get("id"):
-                d["id"] = _new_id()
 
-        if mode == "replace":
-            storage.replace_all_devices(devices)
-        else:
-            storage.merge_devices(devices)
+def build_bandwidth_xlsx(rows_in: list, tag_defs: list) -> bytes:
+    fixed_cols = ["IP", "Interface", "Allocated BW", "Region", "Center", "Link Type",
+                  "Interface_description"]
+    bw_tag_defs = [td for td in tag_defs if "bandwidth" in td.get("scopes", [])]
+    tag_cols = [td["name"] for td in bw_tag_defs]
+    headers = fixed_cols + tag_cols
 
-        for d in devices:
-            for list_name, field in (
-                ("collectorRegions", "Collector Region"),
-                ("deviceClasses", "Device Class"),
-                ("deviceCategories", "Device Category"),
-                ("deviceTypes", "Device Type"),
-            ):
-                storage.add_to_list_if_missing(list_name, d.get(field, ""))
+    rows = []
+    for r in rows_in:
+        row = [r.get(c, "") for c in fixed_cols]
+        for td in bw_tag_defs:
+            row.append((r.get("tags") or {}).get(td["id"], ""))
+        rows.append(row)
 
-        actor = self._actor(body)
-        storage.log_action(actor, "devices.import", {"count": len(devices), "mode": mode})
-        return self._send_json(200, {"imported": len(devices), "mode": mode})
+    return xlsxwriter.write_xlsx("bandwidth_capping", headers, rows)
 
-    def _handle_upsert_bandwidth(self, body):
-        row = body.get("row")
-        if not row or not isinstance(row, dict):
-            raise ValueError("missing 'row' object in request body")
-        is_new = not row.get("id")
-        if is_new:
-            row["id"] = _new_id()
-        storage.upsert_bandwidth_cap(row)
-        actor = self._actor(body)
-        storage.log_action(actor, "bandwidth.create" if is_new else "bandwidth.update",
-                            {"id": row["id"], "ip": row.get("IP", "")})
-        return self._send_json(200, {"row": row})
 
-    def _handle_bandwidth_import(self, body):
-        rows = body.get("rows")
-        mode = body.get("mode", "merge")
-        if not isinstance(rows, list):
-            raise ValueError("'rows' must be a list")
-        for r in rows:
-            if not r.get("id"):
-                r["id"] = _new_id()
+def build_subnets_xlsx(subnets_in: list, tag_defs: list) -> bytes:
+    fixed_cols = ["CIDR", "Description"]
+    subnet_tag_defs = [td for td in tag_defs if "subnets" in td.get("scopes", [])]
+    tag_cols = [td["name"] for td in subnet_tag_defs]
+    headers = fixed_cols + tag_cols
 
-        if mode == "replace":
-            storage.replace_all_bandwidth_caps(rows)
-        else:
-            storage.merge_bandwidth_caps(rows)
+    rows = []
+    for s in subnets_in:
+        row = [s.get(c, "") for c in fixed_cols]
+        for td in subnet_tag_defs:
+            row.append((s.get("tags") or {}).get(td["id"], ""))
+        rows.append(row)
 
-        actor = self._actor(body)
-        storage.log_action(actor, "bandwidth.import", {"count": len(rows), "mode": mode})
-        return self._send_json(200, {"imported": len(rows), "mode": mode})
-
-    def _handle_set_list(self, list_name, body):
-        items = body.get("items")
-        if not isinstance(items, list):
-            raise ValueError("'items' must be a list")
-        storage.set_list(list_name, items)
-        actor = self._actor(body)
-        storage.log_action(actor, "list.update", {"listName": list_name, "count": len(items)})
-        return self._send_json(200, {"listName": list_name, "items": items})
-
-    def _handle_generate(self, body):
-        devices = storage.list_devices()
-        bw_rows = storage.list_bandwidth_caps()
-
-        log_lines = []
-        result = logic.convert_to_collector_configs(
-            devices, bw_rows, log=lambda msg: log_lines.append(msg)
-        )
-
-        files = {}
-        for group_name, group_data in result["groups"].items():
-            filename = f"{group_name}.yaml"
-            files[filename] = yamldump.dump(group_data["config"])
-
-        snmp_total = sum(g["stats"]["snmp_count"] for g in result["groups"].values())
-        icmp_total = sum(g["stats"]["icmp_only_count"] for g in result["groups"].values())
-
-        actor = self._actor(body)
-        summary = f"{len(files)} region(s), {snmp_total} SNMP / {icmp_total} ICMP devices"
-        storage.save_yaml_history(actor, summary, files)
-        storage.log_action(actor, "generate", {
-            "groups": list(result["groups"].keys()),
-            "snmpCount": snmp_total,
-            "icmpCount": icmp_total,
-            "missingCredsCount": len(result["missing_creds_devices"]),
-            "missingRegionCount": len(result["missing_region_devices"]),
-        })
-
-        return self._send_json(200, {
-            "files": files,
-            "groupStats": {name: g["stats"] for name, g in result["groups"].items()},
-            "skippedDevices": result["skipped_devices"],
-            "missingRegionDevices": result["missing_region_devices"],
-            "missingCredsDevices": result["missing_creds_devices"],
-            "orphanedBwIps": result["orphaned_bw_ips"],
-            "totalBwInterfaces": result["total_bw_interfaces"],
-            "snmpTotal": snmp_total,
-            "icmpTotal": icmp_total,
-            "summary": summary,
-        })
+    return xlsxwriter.write_xlsx("subnets", headers, rows)
