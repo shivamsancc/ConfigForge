@@ -1,6 +1,9 @@
-<div align="center">
-  <a href="https://github.com/shivamsancc/ConfigForge">
- <img alt="repo" src="https://raw.githubusercontent.com/shivamsancc/ConfigForge/main/static/logo.svg" alt="Zoos Global" width="100%" />
+<p align="center">
+  <img src=".github/logo.svg" alt="ConfigForge" width="420">
+</p>
+
+<p align="center">
+  <a href="https://github.com/shivamsancc/ConfigForge"><img alt="repo" src="https://img.shields.io/badge/github-shivamsancc%2FConfigForge-181717?logo=github"></a>
   <img alt="status" src="https://img.shields.io/badge/status-active-brightgreen">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-zero-success">
