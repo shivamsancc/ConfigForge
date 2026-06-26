@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/shivamsancc/ConfigForge"><img alt="repo" src="https://img.shields.io/badge/github-shivamsancc%2FConfigForge-181717?logo=github"></a>
+  <a href="https://github.com/shivamsancc/ConfigForge"><img alt="repo" src="[https://github.com/shivamsancc/ConfigForge/blob/main/static/logo.svg?logo=github"></a>
   <img alt="status" src="https://img.shields.io/badge/status-active-brightgreen">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-zero-success">
