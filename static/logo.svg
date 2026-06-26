@@ -1,0 +1,27 @@
+<svg width="480" height="120" viewBox="0 0 480 120" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="nm-grad" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9DBFE8"/>
+      <stop offset="1" stop-color="#A88FD6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- network-node mark -->
+  <g transform="translate(20, 20)">
+    <line x1="20" y1="22" x2="40" y2="40" stroke="url(#nm-grad)" stroke-width="2.4" opacity="0.7"/>
+    <line x1="62" y1="24" x2="40" y2="40" stroke="url(#nm-grad)" stroke-width="2.4" opacity="0.7"/>
+    <line x1="24" y1="62" x2="40" y2="40" stroke="url(#nm-grad)" stroke-width="2.4" opacity="0.7"/>
+    <line x1="58" y1="58" x2="40" y2="40" stroke="url(#nm-grad)" stroke-width="2.4" opacity="0.7"/>
+    <circle cx="40" cy="40" r="9" fill="url(#nm-grad)"/>
+    <circle cx="20" cy="22" r="5.5" fill="#7AA2D6"/>
+    <circle cx="62" cy="24" r="5.5" fill="#7AA2D6"/>
+    <circle cx="24" cy="62" r="5.5" fill="#A88FD6"/>
+    <circle cx="58" cy="58" r="5.5" fill="#A88FD6"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="120" y="68" font-family="-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        font-size="40" font-weight="650" fill="#1C2331">Config<tspan fill="#6B5B95">Forge</tspan></text>
+  <text x="121" y="92" font-family="-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        font-size="13" fill="#6B7280" letter-spacing="0.3">SNMP collector config, generated from a shared inventory</text>
+</svg>

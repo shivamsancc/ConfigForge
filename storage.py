@@ -1,18 +1,21 @@
 """
 Storage layer: SQLite (WAL mode), thread-safe via a global lock.
 
-Tables:
+Tables (created/evolved by migrations.py, never directly here):
   devices         - one row per device, JSON blob + indexed id
   bandwidth_caps  - one row per bandwidth cap entry
   subnets         - one row per subnet (CIDR-based)
-  lists           - the 4 fixed managed dropdowns (Collector Region,
-                    Device Class, Device Category, Device Type)
+  lists           - the one fixed managed dropdown: Collector Region.
+                    Every other categorization (Device Class, Region,
+                    custom fields, etc.) lives in tag_defs instead --
+                    Collector Region is the sole exception because it's
+                    mandatory and drives YAML generation directly.
   tag_defs        - dynamic tag list definitions, each with a name, the
                     scopes (devices/bandwidth/subnets) it applies to, and
                     its set of allowed values
   audit_log       - append-only action log
   yaml_history    - past generations
-  meta            - small key/value store (lastSavedAt, lastSavedBy)
+  meta            - small key/value store (lastSavedAt, lastSavedBy, schema_version)
 
 SNMPv3 authKey/privKey are AES-256-GCM encrypted at rest (aesgcm.py).
 """
@@ -25,6 +28,7 @@ import uuid
 import ipaddress
 
 import aesgcm
+import migrations
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection = None
@@ -36,7 +40,13 @@ _CRED_FIELDS = ("authKey", "privKey")
 _ENC_KEY = b"ConfigForge-static-at-rest-key!!"  # exactly 32 bytes
 assert len(_ENC_KEY) == 32
 
-FIXED_LISTS = ("collectorRegions", "deviceClasses", "deviceCategories", "deviceTypes")
+# Collector Region is the only field that remains a hardcoded, mandatory
+# concept -- it's what generation groups devices by, so the system can't
+# function without it. Every other categorization is created on demand
+# through the Tags module (see migrations.py migrate_3 for how
+# Device Class / Device Category / Device Type / Operating Region /
+# geolocation / Region / Center get migrated into tags for upgraders).
+FIXED_LISTS = ("collectorRegions",)
 TAG_SCOPES = ("devices", "bandwidth", "subnets")
 
 
@@ -46,36 +56,7 @@ def init(db_path: str):
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode=WAL")
     with _lock:
-        _conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS devices (
-                id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS bandwidth_caps (
-                id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS subnets (
-                id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS lists (
-                list_name TEXT PRIMARY KEY, items TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS tag_defs (
-                id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id TEXT PRIMARY KEY, ts REAL NOT NULL, actor TEXT,
-                action TEXT NOT NULL, details TEXT
-            );
-            CREATE TABLE IF NOT EXISTS yaml_history (
-                id TEXT PRIMARY KEY, ts REAL NOT NULL, actor TEXT,
-                summary TEXT, files TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY, value TEXT
-            );
-            """
-        )
+        migrations.run_pending_migrations(_conn)
         for name in FIXED_LISTS:
             _conn.execute(
                 "INSERT OR IGNORE INTO lists (list_name, items) VALUES (?, ?)",
@@ -293,7 +274,7 @@ def find_subnet_for_ip(ip_str: str, subnets: list = None):
 
 
 # ---------------------------------------------------------------------------
-# Fixed lists (Collector Region / Device Class / Device Category / Device Type)
+# Fixed lists (Collector Region only -- see module docstring)
 # ---------------------------------------------------------------------------
 def get_lists():
     with _lock:
@@ -313,14 +294,9 @@ def set_list(list_name, items: list):
 
 def list_usage_count(list_name, value):
     """How many devices currently have `value` set for the field that
-    corresponds to `list_name` (only applies to the 4 fixed lists, which
-    map 1:1 onto fixed device fields)."""
-    field_map = {
-        "collectorRegions": "Collector Region",
-        "deviceClasses": "Device Class",
-        "deviceCategories": "Device Category",
-        "deviceTypes": "Device Type",
-    }
+    corresponds to `list_name`. Collector Region is the only fixed list
+    left -- everything else lives in tag_defs and uses tag_value_usage_count."""
+    field_map = {"collectorRegions": "Collector Region"}
     field = field_map.get(list_name)
     if not field:
         return 0

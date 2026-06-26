@@ -16,8 +16,25 @@ def normalize_group_key(region: str) -> str:
     return key.strip("_") or "unknown"
 
 
-def should_be_icmp_only(device: dict) -> bool:
-    cls = (device.get("Device Class") or "").strip().lower()
+def is_valid_ip(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def should_be_icmp_only(device: dict, resolved_tags: dict = None) -> bool:
+    """Device Class is no longer a guaranteed fixed field -- it only
+    exists once someone creates a "Device Class" tag through the Tags
+    module. So this checks the *resolved* tag value by name (falling
+    back to nothing if that tag doesn't exist in this deployment), plus
+    the still-hardcoded Config Type field, which remains a bare device
+    field rather than a tag."""
+    resolved_tags = resolved_tags or {}
+    cls = (resolved_tags.get("Device Class") or "").strip().lower()
     cfg = (device.get("Config Type") or "").strip().lower()
     return cls == "storage" or cfg in ("icmp", "snmp trap")
 
@@ -91,6 +108,7 @@ def convert_to_collector_configs(devices: list, bandwidth_rows: list, subnets: l
     groups = {}          # group_key -> {"region": display name, "devices": [...]}
     group_stats = {}
     skipped_devices = 0
+    invalid_ip_devices = []
     missing_region_devices = []
     missing_creds_devices = []
     used_bw_ips = set()
@@ -99,6 +117,9 @@ def convert_to_collector_configs(devices: list, bandwidth_rows: list, subnets: l
         ip = (device.get("IP") or "").strip()
         if not ip:
             skipped_devices += 1
+            continue
+        if not is_valid_ip(ip):
+            invalid_ip_devices.append({"ip": ip, "device": device.get("Device", "")})
             continue
         device_ips.add(ip)
 
@@ -114,9 +135,6 @@ def convert_to_collector_configs(devices: list, bandwidth_rows: list, subnets: l
             "bw_devices": 0, "bw_interfaces": 0,
         })
 
-        forced_icmp = should_be_icmp_only(device)
-        full_creds = has_full_creds(device)
-
         subnet_match = None
         for s in subnets:
             cidr = (s.get("CIDR") or "").strip()
@@ -131,11 +149,15 @@ def convert_to_collector_configs(devices: list, bandwidth_rows: list, subnets: l
                 continue
 
         resolved_tags = resolve_tags_for_record(device, tag_defs, subnet_match)
+        forced_icmp = should_be_icmp_only(device, resolved_tags)
+        full_creds = has_full_creds(device)
 
         entry = {
             "ip": ip,
             "device": device.get("Device", ""),
         }
+        if subnet_match:
+            entry["subnet"] = subnet_match.get("CIDR", "")
         if resolved_tags:
             entry["tags"] = resolved_tags
 
@@ -189,6 +211,7 @@ def convert_to_collector_configs(devices: list, bandwidth_rows: list, subnets: l
         "files": files,  # group_key.yaml -> config dict (caller runs yamldump)
         "groupStats": group_stats,
         "skippedDevices": skipped_devices,
+        "invalidIpDevices": invalid_ip_devices,
         "missingRegionDevices": missing_region_devices,
         "missingCredsDevices": missing_creds_devices,
         "orphanedBwIps": orphaned_bw_ips,

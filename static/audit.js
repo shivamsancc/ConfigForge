@@ -3,23 +3,48 @@
 // ============================================================================
 
 const Audit = (() => {
+  let searchQuery = '';
+  let cachedEntries = [];
+
   async function render() {
     const content = document.getElementById('content');
     content.innerHTML = `<div class="loading-row"><div class="spinner"></div> Loading audit log&hellip;</div>`;
-    let entries = [];
     try {
       const res = await Api.getAudit(200);
-      entries = res.entries || [];
+      cachedEntries = res.entries || [];
     } catch (e) {
       reportError(e, 'Failed to load audit log');
       content.innerHTML = emptyState({ title: 'Could not load audit log' });
       return;
     }
-    if (entries.length === 0) {
+    if (cachedEntries.length === 0) {
       content.innerHTML = emptyState({ title: 'No audit entries yet' });
       return;
     }
     content.innerHTML = `
+      <div class="flex justify-between items-center mb-16">
+        ${renderSearchBox('audit-search', 'Search audit log\u2026')}
+        <div class="text-dim" id="audit-count-label"></div>
+      </div>
+      <div id="audit-body"></div>
+    `;
+    const searchBox = document.getElementById('audit-search');
+    searchBox.value = searchQuery;
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
+    renderBody();
+  }
+
+  function renderBody() {
+    const body = document.getElementById('audit-body');
+    const entries = searchQuery ? cachedEntries.filter(e => rowMatchesSearch(e, searchQuery)) : cachedEntries;
+    document.getElementById('audit-count-label').textContent =
+      searchQuery ? `${entries.length} of ${cachedEntries.length} entries` : `${cachedEntries.length} entries`;
+
+    if (entries.length === 0) {
+      body.innerHTML = emptyState({ title: 'No entries match your search', sub: `No results for "${searchQuery}".` });
+      return;
+    }
+    body.innerHTML = `
       <div class="panel"><div class="table-wrap">
         <table>
           <thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead>

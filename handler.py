@@ -51,6 +51,7 @@ schema, so their DELETE is unconditional.
 """
 import json
 import re
+import ipaddress
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -248,6 +249,9 @@ class Handler(BaseHTTPRequestHandler):
         device = body.get("device")
         if not isinstance(device, dict):
             return self._send_json({"error": "'device' must be an object"}, 400)
+        ip = (device.get("IP") or "").strip()
+        if ip and not logic.is_valid_ip(ip):
+            return self._send_json({"error": f"'{ip}' is not a valid IP address"}, 400)
         is_create = not device.get("id")
         saved = storage.upsert_device(device)
         storage.log_audit(actor, "create_device" if is_create else "update_device",
@@ -258,6 +262,9 @@ class Handler(BaseHTTPRequestHandler):
         row = body.get("row")
         if not isinstance(row, dict):
             return self._send_json({"error": "'row' must be an object"}, 400)
+        ip = (row.get("IP") or "").strip()
+        if ip and not logic.is_valid_ip(ip):
+            return self._send_json({"error": f"'{ip}' is not a valid IP address"}, 400)
         is_create = not row.get("id")
         saved = storage.upsert_bandwidth(row)
         storage.log_audit(actor, "create_bandwidth" if is_create else "update_bandwidth",
@@ -268,6 +275,12 @@ class Handler(BaseHTTPRequestHandler):
         subnet = body.get("subnet")
         if not isinstance(subnet, dict):
             return self._send_json({"error": "'subnet' must be an object"}, 400)
+        cidr = (subnet.get("CIDR") or "").strip()
+        if cidr:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                return self._send_json({"error": f"'{cidr}' is not a valid CIDR"}, 400)
         is_create = not subnet.get("id")
         saved = storage.upsert_subnet(subnet)
         storage.log_audit(actor, "create_subnet" if is_create else "update_subnet",
@@ -401,9 +414,13 @@ class Handler(BaseHTTPRequestHandler):
 # Excel export (template-compatible with the import flow)
 # ---------------------------------------------------------------------------
 def build_devices_xlsx(devices: list, tag_defs: list) -> bytes:
-    fixed_cols = ["IP", "Device", "Collector Region", "Operating Region", "Config Type",
-                  "geolocation", "Region", "Center", "Device Class", "Device Category",
-                  "Device Type", "Remarks",
+    # Only IP, Device, Collector Region (mandatory, hardcoded), Config
+    # Type, Remarks, and credentials remain bare device fields. Every
+    # other categorization (Device Class, Region, Center, etc.) is now
+    # tag-driven and only appears as a column if/when someone actually
+    # creates that tag through the Tags module -- see migrations.py
+    # migrate_3 for how pre-existing values get promoted into tags.
+    fixed_cols = ["IP", "Device", "Collector Region", "Config Type", "Remarks",
                   "snmpUser", "authProtocol", "authKey", "privProtocol", "privKey"]
     device_tag_defs = [td for td in tag_defs if "devices" in td.get("scopes", [])]
     tag_cols = [td["name"] for td in device_tag_defs]

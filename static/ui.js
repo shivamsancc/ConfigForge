@@ -3,11 +3,16 @@
 // ============================================================================
 
 function getEditorName() {
-  let name = sessionStorage.getItem('editorName');
-  if (!name) {
-    name = (window.prompt('Your name (used for audit-log attribution on changes you make):') || '').trim();
-    if (!name) name = 'unknown';
-    sessionStorage.setItem('editorName', name);
+  let name = localStorage.getItem('editorName');
+  while (!name) {
+    const entered = (window.prompt('Your name (required \u2014 used for audit-log attribution on changes you make):') || '').trim();
+    if (entered) {
+      name = entered;
+      localStorage.setItem('editorName', name);
+    }
+    // If the person cancels or submits blank, the loop re-prompts rather
+    // than silently falling back to "unknown" -- a name is required
+    // before any write can proceed.
   }
   return name;
 }
@@ -182,4 +187,49 @@ function emptyState({ title, sub, icon } = {}) {
       ${sub ? `<div class="empty-state-sub">${escapeHtml(sub)}</div>` : ''}
     </div>
   `;
+}
+
+// ---------------------------------------------------------------------------
+// IP address validation -- mirrors logic.py's is_valid_ip so the frontend
+// catches obviously-malformed input before it ever reaches the server.
+// Not a full RFC validator (full validation happens server-side via
+// Python's ipaddress module) -- this just catches the common mistakes:
+// wrong octet count, octets out of 0-255 range, non-numeric junk.
+// ---------------------------------------------------------------------------
+function isValidIp(value) {
+  if (!value) return false;
+  const v = value.trim();
+
+  const ipv4Match = v.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    return ipv4Match.slice(1, 5).every(octet => {
+      const n = Number(octet);
+      return n >= 0 && n <= 255;
+    });
+  }
+
+  // Lightweight IPv6 sanity check.
+  if (v.includes(':') && /^[0-9a-fA-F:]+$/.test(v)) {
+    const segments = v.split(':');
+    return segments.length >= 3 && segments.length <= 8;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Client-side search filtering -- runs entirely in the browser (no server
+// round-trip) so it's instant. Matches if the query is a case-insensitive
+// substring of any value in the row, across every visible field.
+// ---------------------------------------------------------------------------
+function rowMatchesSearch(row, query) {
+  if (!query) return true;
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const haystack = JSON.stringify(row).toLowerCase();
+  return haystack.includes(q);
+}
+
+function renderSearchBox(id, placeholder) {
+  return `<input type="text" id="${id}" class="search-box" placeholder="${escapeHtml(placeholder || 'Search\u2026')}" autocomplete="off">`;
 }

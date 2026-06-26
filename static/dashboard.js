@@ -35,11 +35,6 @@ const Dashboard = (() => {
         <div class="panel panel-body">${breakdownBars(groupCount(state.devices, 'Collector Region'))}</div>
       </div>
 
-      <div class="dash-section">
-        <div class="dash-section-title">Devices by Device Class</div>
-        <div class="panel panel-body">${breakdownBars(groupCount(state.devices, 'Device Class'))}</div>
-      </div>
-
       ${state.tagDefs.length > 0 ? renderTagBreakdowns() : ''}
 
       <div class="dash-section">

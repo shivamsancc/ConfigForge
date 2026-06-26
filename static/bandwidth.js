@@ -3,6 +3,8 @@
 // ============================================================================
 
 const Bandwidth = (() => {
+  let searchQuery = '';
+
   const FIELDS = [
     { key: 'IP', label: 'IP', required: true },
     { key: 'Interface', label: 'Interface', required: true },
@@ -13,18 +15,24 @@ const Bandwidth = (() => {
     { key: 'Interface_description', label: 'Interface Description' },
   ];
 
+  function filteredRows() {
+    if (!searchQuery) return state.bandwidth;
+    return state.bandwidth.filter(b => rowMatchesSearch(b, searchQuery));
+  }
+
   async function render() {
     const content = document.getElementById('content');
     const mode = state.viewMode.bandwidth;
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
-        <div class="flex gap-8 wrap">
+        <div class="flex gap-8 wrap items-center">
           <button class="btn btn-primary" id="btn-add-bw">+ Add Row</button>
           <button class="btn" id="btn-import-bw">Import from Excel</button>
           <button class="btn" id="btn-export-bw">Export to Excel</button>
+          ${renderSearchBox('bw-search', 'Search bandwidth rows\u2026')}
         </div>
         <div class="flex gap-12 items-center">
-          <div class="text-dim">${state.bandwidth.length} row(s)</div>
+          <div class="text-dim" id="bw-count-label">${state.bandwidth.length} row(s)</div>
           <div class="view-toggle">
             <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
             <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
@@ -38,22 +46,33 @@ const Bandwidth = (() => {
     document.getElementById('btn-import-bw').addEventListener('click', () => openImportDialog());
     document.getElementById('btn-export-bw').addEventListener('click', handleExport);
     content.querySelectorAll('.view-toggle button').forEach(btn => {
-      btn.addEventListener('click', () => { state.viewMode.bandwidth = btn.dataset.mode; render(); });
+      btn.addEventListener('click', () => { state.viewMode.bandwidth = btn.dataset.mode; saveViewModePrefs(); render(); });
     });
+    const searchBox = document.getElementById('bw-search');
+    searchBox.value = searchQuery;
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
   }
 
   function renderBody() {
     const body = document.getElementById('bw-body');
+    const rows = filteredRows();
+    document.getElementById('bw-count-label').textContent =
+      searchQuery ? `${rows.length} of ${state.bandwidth.length} row(s)` : `${state.bandwidth.length} row(s)`;
+
     if (state.bandwidth.length === 0) {
       body.innerHTML = emptyState({ title: 'No bandwidth caps yet', sub: 'Add a row manually or import a spreadsheet.' });
       return;
     }
-    body.innerHTML = state.viewMode.bandwidth === 'card' ? renderCards() : `<div class="panel"><div class="table-wrap">${renderTable()}</div></div>`;
+    if (rows.length === 0) {
+      body.innerHTML = emptyState({ title: 'No rows match your search', sub: `No results for "${searchQuery}".` });
+      return;
+    }
+    body.innerHTML = state.viewMode.bandwidth === 'card' ? renderCards(rows) : `<div class="panel"><div class="table-wrap">${renderTable(rows)}</div></div>`;
     wireRowActions();
   }
 
-  function renderTable() {
-    const rows = state.bandwidth.map(b => `
+  function renderTable(rows) {
+    const trs = rows.map(b => `
       <tr data-id="${escapeHtml(b.id)}">
         <td class="mono">${escapeHtml(b.IP)}</td>
         <td class="mono">${escapeHtml(b.Interface)}</td>
@@ -75,14 +94,14 @@ const Bandwidth = (() => {
           <th>IP</th><th>Interface</th><th>Allocated BW</th><th>Region</th>
           <th>Center</th><th>Link Type</th><th>Interface Description</th><th>Tags</th><th></th>
         </tr></thead>
-        <tbody>${rows}</tbody>
+        <tbody>${trs}</tbody>
       </table>
     `;
   }
 
-  function renderCards() {
-    const cards = state.bandwidth.map(b => `
-      <div class="data-card" data-id="${escapeHtml(b.id)}">
+  function renderCards(rows) {
+    const cards = rows.map(b => `
+      <div class="data-card" data-id="${escapeHtml(b.id)}" data-open-detail="1">
         <div class="data-card-header">
           <div>
             <div class="data-card-title">${escapeHtml(b.Interface)}</div>
@@ -109,6 +128,9 @@ const Bandwidth = (() => {
       const row = state.bandwidth.find(b => String(b.id) === String(id));
       el.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); openForm(row); }));
       el.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); handleDelete(row); }));
+      if (el.dataset.openDetail) {
+        el.addEventListener('click', () => openForm(row));
+      }
     });
   }
 
@@ -141,6 +163,7 @@ const Bandwidth = (() => {
               <div class="field">
                 <label>${escapeHtml(f.label)}${f.required ? '<span class="req">*</span>' : ''}</label>
                 <input type="text" name="${f.key}" value="${escapeHtml(b[f.key] || '')}" ${f.required ? 'required' : ''}>
+                ${f.key === 'IP' ? '<span class="field-hint" id="bw-ip-validation-hint"></span>' : ''}
               </div>
             `).join('')}
           </div>
@@ -162,9 +185,23 @@ const Bandwidth = (() => {
     if (isEdit) {
       overlay.querySelector('[data-act="delete"]').addEventListener('click', async () => { closeModal(overlay); await handleDelete(b); });
     }
+
+    const ipInput = overlay.querySelector('input[name="IP"]');
+    const ipHint = overlay.querySelector('#bw-ip-validation-hint');
+    ipInput.addEventListener('input', () => {
+      if (!ipInput.value.trim()) { ipHint.textContent = ''; return; }
+      ipHint.textContent = isValidIp(ipInput.value) ? '' : 'Doesn\u2019t look like a valid IP address.';
+      ipHint.style.color = isValidIp(ipInput.value) ? '' : 'var(--red)';
+    });
+
     overlay.querySelector('[data-act="save"]').addEventListener('click', async () => {
       const form = overlay.querySelector('#bw-form');
       if (!form.reportValidity()) return;
+      if (!isValidIp(ipInput.value)) {
+        toast('Please enter a valid IP address', 'warn');
+        ipInput.focus();
+        return;
+      }
       const fd = new FormData(form);
       const payload = isEdit ? { id: b.id } : {};
       for (const [k, v] of fd.entries()) {
@@ -259,8 +296,11 @@ const Bandwidth = (() => {
       const bwTagDefs = TagFields.defsForScope('bandwidth');
 
       const records = [];
+      let skippedInvalidIp = 0;
       for (const r of rows) {
-        if (!String(r['IP'] || '').trim() || !String(r['Interface'] || '').trim()) continue;
+        const ip = String(r['IP'] || '').trim();
+        if (!ip || !String(r['Interface'] || '').trim()) continue;
+        if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
         const rec = {};
         for (const f of FIELDS) rec[f.key] = String(r[f.key] || '');
         rec.tags = {};
@@ -276,7 +316,10 @@ const Bandwidth = (() => {
         importBtn.textContent = 'Importing\u2026';
         await Api.importBandwidth(records, mode);
         await TagFields.registerNewValuesFromImport('bandwidth', records);
-        toast(`Imported ${records.length} row(s) (${mode})`, 'success');
+        const msg = skippedInvalidIp > 0
+          ? `Imported ${records.length} row(s) (${mode}) \u2014 skipped ${skippedInvalidIp} row(s) with an invalid IP`
+          : `Imported ${records.length} row(s) (${mode})`;
+        toast(msg, skippedInvalidIp > 0 ? 'warn' : 'success');
         closeModal(overlay);
         await reloadAllData();
         render();

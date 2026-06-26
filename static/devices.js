@@ -1,30 +1,32 @@
 // ============================================================================
 // DEVICES VIEW
+//
+// Collector Region is the one field that stays permanently built-in --
+// mandatory, drives YAML generation grouping. Everything else that used
+// to be a hardcoded field (Device Class, Device Category, Device Type,
+// Operating Region, Geolocation, Region, Center) only appears as a form
+// field once someone creates the matching tag through the Tags module.
+// Existing data from before this change gets migrated into tags
+// automatically (see migrations.py) so nothing is lost on upgrade.
 // ============================================================================
 
 const Devices = (() => {
-  const FREE_TEXT_FIELDS = [
-    { key: 'IP', label: 'IP', required: true },
-    { key: 'Device', label: 'Device' },
-    { key: 'Operating Region', label: 'Operating Region' },
-    { key: 'geolocation', label: 'Geolocation' },
-    { key: 'Region', label: 'Region' },
-    { key: 'Center', label: 'Center' },
-  ];
-
-  const DROPDOWN_FIELDS = [
-    { key: 'Collector Region', label: 'Collector Region', listKey: 'collectorRegions', flagged: true },
-    { key: 'Device Class', label: 'Device Class', listKey: 'deviceClasses' },
-    { key: 'Device Category', label: 'Device Category', listKey: 'deviceCategories' },
-    { key: 'Device Type', label: 'Device Type', listKey: 'deviceTypes' },
-  ];
+  let searchQuery = '';
 
   function missingCreds(d) {
     return !d.snmpUser || !d.authProtocol || !d.authKey || !d.privProtocol || !d.privKey;
   }
 
+  // Device Class is now tag-driven (no longer a guaranteed fixed field),
+  // so ICMP-forcing is checked by resolved tag name, same as the backend.
+  function resolvedDeviceClass(d) {
+    const deviceClassDef = state.tagDefs.find(td => td.name === 'Device Class' && (td.scopes || []).includes('devices'));
+    if (!deviceClassDef) return '';
+    return (d.tags || {})[deviceClassDef.id] || '';
+  }
+
   function isIcmpForced(d) {
-    const cls = (d['Device Class'] || '').trim().toLowerCase();
+    const cls = resolvedDeviceClass(d).trim().toLowerCase();
     const cfg = (d['Config Type'] || '').trim().toLowerCase();
     return cls === 'storage' || cfg === 'icmp' || cfg === 'snmp trap';
   }
@@ -40,18 +42,24 @@ const Devices = (() => {
     return escapeHtml(d['Collector Region']);
   }
 
+  function filteredDevices() {
+    if (!searchQuery) return state.devices;
+    return state.devices.filter(d => rowMatchesSearch(d, searchQuery));
+  }
+
   async function render() {
     const content = document.getElementById('content');
     const mode = state.viewMode.devices;
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
-        <div class="flex gap-8 wrap">
+        <div class="flex gap-8 wrap items-center">
           <button class="btn btn-primary" id="btn-add-device">+ Add Device</button>
           <button class="btn" id="btn-import-devices">Import from Excel</button>
           <button class="btn" id="btn-export-devices">Export to Excel</button>
+          ${renderSearchBox('device-search', 'Search devices\u2026')}
         </div>
         <div class="flex gap-12 items-center">
-          <div class="text-dim">${state.devices.length} device(s)</div>
+          <div class="text-dim" id="device-count-label">${state.devices.length} device(s)</div>
           <div class="view-toggle">
             <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
             <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
@@ -66,30 +74,38 @@ const Devices = (() => {
     document.getElementById('btn-import-devices').addEventListener('click', () => openImportDialog());
     document.getElementById('btn-export-devices').addEventListener('click', handleExport);
     content.querySelectorAll('.view-toggle button').forEach(btn => {
-      btn.addEventListener('click', () => { state.viewMode.devices = btn.dataset.mode; render(); });
+      btn.addEventListener('click', () => { state.viewMode.devices = btn.dataset.mode; saveViewModePrefs(); render(); });
     });
+    const searchBox = document.getElementById('device-search');
+    searchBox.value = searchQuery;
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
   }
 
   function renderBody() {
     const body = document.getElementById('devices-body');
+    const devices = filteredDevices();
+    document.getElementById('device-count-label').textContent =
+      searchQuery ? `${devices.length} of ${state.devices.length} device(s)` : `${state.devices.length} device(s)`;
+
     if (state.devices.length === 0) {
       body.innerHTML = emptyState({ title: 'No devices yet', sub: 'Add one manually or import a spreadsheet to get started.' });
       return;
     }
-    body.innerHTML = state.viewMode.devices === 'card' ? renderCards() : `<div class="panel"><div class="table-wrap">${renderTable()}</div></div>`;
+    if (devices.length === 0) {
+      body.innerHTML = emptyState({ title: 'No devices match your search', sub: `No results for "${searchQuery}".` });
+      return;
+    }
+    body.innerHTML = state.viewMode.devices === 'card' ? renderCards(devices) : `<div class="panel"><div class="table-wrap">${renderTable(devices)}</div></div>`;
     wireRowActions();
   }
 
-  function renderTable() {
-    const rows = state.devices.map(d => `
+  function renderTable(devices) {
+    const rows = devices.map(d => `
       <tr data-id="${escapeHtml(d.id)}">
         <td class="mono">${escapeHtml(d.IP)}</td>
         <td>${escapeHtml(d.Device)}</td>
         <td>${regionBadge(d)}</td>
         <td>${escapeHtml(d['Config Type'])}</td>
-        <td>${escapeHtml(d['Device Class'])}</td>
-        <td>${escapeHtml(d['Device Category'])}</td>
-        <td>${escapeHtml(d['Device Type'])}</td>
         <td>${TagFields.renderBadges('devices', d.tags) || '<span class="text-faint">&mdash;</span>'}</td>
         <td>${credBadge(d)}</td>
         <td>
@@ -103,7 +119,6 @@ const Devices = (() => {
       <table>
         <thead><tr>
           <th>IP</th><th>Device</th><th>Collector Region</th><th>Config Type</th>
-          <th>Device Class</th><th>Device Category</th><th>Device Type</th>
           <th>Tags</th><th>Status</th><th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -111,9 +126,9 @@ const Devices = (() => {
     `;
   }
 
-  function renderCards() {
-    const cards = state.devices.map(d => `
-      <div class="data-card" data-id="${escapeHtml(d.id)}" data-act-card="edit">
+  function renderCards(devices) {
+    const cards = devices.map(d => `
+      <div class="data-card" data-id="${escapeHtml(d.id)}" data-open-detail="1">
         <div class="data-card-header">
           <div>
             <div class="data-card-title">${escapeHtml(d.Device || '(unnamed)')}</div>
@@ -123,7 +138,6 @@ const Devices = (() => {
         </div>
         <div class="data-card-meta">
           ${regionBadge(d)}
-          ${d['Device Class'] ? `<span class="badge badge-neutral">${escapeHtml(d['Device Class'])}</span>` : ''}
           ${TagFields.renderBadges('devices', d.tags)}
         </div>
         <div class="data-card-actions">
@@ -141,6 +155,12 @@ const Devices = (() => {
       const device = state.devices.find(d => String(d.id) === String(id));
       el.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); openForm(device); }));
       el.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); handleDelete(device); }));
+      // Clicking the card itself (outside the action buttons) opens the
+      // same edit form -- previously this did nothing, which made the
+      // card view feel broken.
+      if (el.dataset.openDetail) {
+        el.addEventListener('click', () => openForm(device));
+      }
     });
   }
 
@@ -167,6 +187,8 @@ const Devices = (() => {
   function openForm(device) {
     const isEdit = !!device;
     const d = device || {};
+    const initialCfg = (d['Config Type'] || '').toLowerCase();
+    const initialIcmpForced = initialCfg === 'icmp' || initialCfg === 'snmp trap';
 
     const overlay = openModal(`
       <div class="modal-header">
@@ -176,70 +198,79 @@ const Devices = (() => {
       <div class="modal-body">
         <form id="device-form">
           <div class="form-grid mb-16">
-            ${FREE_TEXT_FIELDS.map(f => `
-              <div class="field">
-                <label>${escapeHtml(f.label)}${f.required ? '<span class="req">*</span>' : ''}</label>
-                <input type="text" name="${f.key}" value="${escapeHtml(d[f.key] || '')}" ${f.required ? 'required' : ''}>
-              </div>
-            `).join('')}
-          </div>
-
-          <div class="form-grid mb-16">
-            ${DROPDOWN_FIELDS.map(f => `
-              <div class="field">
-                <label>${escapeHtml(f.label)}${f.flagged ? '<span class="req">*</span>' : ''}</label>
-                <select name="${f.key}">${listOptions(f.listKey, d[f.key] || '')}</select>
-                ${f.flagged ? `<span class="field-hint">Needed for this device to appear in generated YAML.</span>` : ''}
-              </div>
-            `).join('')}
+            <div class="field">
+              <label>IP<span class="req">*</span></label>
+              <input type="text" name="IP" value="${escapeHtml(d.IP || '')}" required placeholder="e.g. 10.1.1.1">
+              <span class="field-hint" id="ip-validation-hint"></span>
+            </div>
+            <div class="field">
+              <label>Device</label>
+              <input type="text" name="Device" value="${escapeHtml(d.Device || '')}">
+            </div>
+            <div class="field">
+              <label>Collector Region<span class="req">*</span></label>
+              <select name="Collector Region">${listOptions('collectorRegions', d['Collector Region'] || '')}</select>
+              <span class="field-hint">Needed for this device to appear in generated YAML. Devices without it are saved but excluded at generate time.</span>
+            </div>
             <div class="field">
               <label>Config Type</label>
-              <select name="Config Type">
+              <select name="Config Type" id="config-type-select">
                 <option value="">&mdash; none &mdash;</option>
                 ${['SNMP', 'ICMP', 'SNMP Trap'].map(v => `<option value="${v}"${(d['Config Type'] || '') === v ? ' selected' : ''}>${v}</option>`).join('')}
               </select>
-              <span class="field-hint">ICMP / SNMP Trap force ping-only regardless of credentials.</span>
+              <span class="field-hint">ICMP / SNMP Trap force ping-only and hide the credential fields below.</span>
+            </div>
+            <div class="field span-2">
+              <label>Remarks</label>
+              <input type="text" name="Remarks" value="${escapeHtml(d.Remarks || '')}">
             </div>
           </div>
 
-          <div class="panel-header" style="padding:0 0 10px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;">
-            <h2 style="font-size:13px;color:var(--text-dim);">Tags</h2>
-          </div>
-          <div class="form-grid mb-16">
-            ${TagFields.renderFormFields('devices', d.tags)}
-          </div>
+          ${TagFields.defsForScope('devices').length > 0 ? `
+            <div class="panel-header" style="padding:0 0 10px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;">
+              <h2 style="font-size:13px;color:var(--text-dim);">Tags</h2>
+            </div>
+            <div class="form-grid mb-16">
+              ${TagFields.renderFormFields('devices', d.tags)}
+            </div>
+          ` : ''}
 
-          <div class="panel-header" style="padding:0 0 10px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;">
-            <h2 style="font-size:13px;color:var(--text-dim);">SNMPv3 Credentials <span class="req">*</span></h2>
+          <div id="creds-section" style="display:${initialIcmpForced ? 'none' : 'block'};">
+            <div class="panel-header" style="padding:0 0 10px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;">
+              <h2 style="font-size:13px;color:var(--text-dim);">SNMPv3 Credentials <span class="req">*</span></h2>
+            </div>
+            <div class="field-hint mb-12">Required for SNMP polling. Devices missing any of these are still included at generate time, flagged as needing attention.</div>
+            <div class="form-grid">
+              <div class="field">
+                <label>SNMP User</label>
+                <input type="text" name="snmpUser" value="${escapeHtml(d.snmpUser || '')}">
+              </div>
+              <div class="field">
+                <label>Auth Protocol</label>
+                <select name="authProtocol">${['SHA', 'MD5'].map(v => `<option value="${v}"${(d.authProtocol || 'SHA') === v ? ' selected' : ''}>${v}</option>`).join('')}</select>
+              </div>
+              <div class="field">
+                <label>Auth Key</label>
+                <div class="password-field">
+                  <input type="password" name="authKey" value="${escapeHtml(d.authKey || '')}">
+                  <button type="button" class="password-toggle" data-toggle="authKey">show</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Priv Protocol</label>
+                <select name="privProtocol">${['AES', 'DES'].map(v => `<option value="${v}"${(d.privProtocol || 'AES') === v ? ' selected' : ''}>${v}</option>`).join('')}</select>
+              </div>
+              <div class="field">
+                <label>Priv Key</label>
+                <div class="password-field">
+                  <input type="password" name="privKey" value="${escapeHtml(d.privKey || '')}">
+                  <button type="button" class="password-toggle" data-toggle="privKey">show</button>
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="field-hint mb-12">Required for SNMP polling. Devices missing any of these are still included at generate time, flagged as needing attention.</div>
-          <div class="form-grid">
-            <div class="field">
-              <label>SNMP User</label>
-              <input type="text" name="snmpUser" value="${escapeHtml(d.snmpUser || '')}">
-            </div>
-            <div class="field">
-              <label>Auth Protocol</label>
-              <select name="authProtocol">${['SHA', 'MD5'].map(v => `<option value="${v}"${(d.authProtocol || 'SHA') === v ? ' selected' : ''}>${v}</option>`).join('')}</select>
-            </div>
-            <div class="field">
-              <label>Auth Key</label>
-              <div class="password-field">
-                <input type="password" name="authKey" value="${escapeHtml(d.authKey || '')}">
-                <button type="button" class="password-toggle" data-toggle="authKey">show</button>
-              </div>
-            </div>
-            <div class="field">
-              <label>Priv Protocol</label>
-              <select name="privProtocol">${['AES', 'DES'].map(v => `<option value="${v}"${(d.privProtocol || 'AES') === v ? ' selected' : ''}>${v}</option>`).join('')}</select>
-            </div>
-            <div class="field">
-              <label>Priv Key</label>
-              <div class="password-field">
-                <input type="password" name="privKey" value="${escapeHtml(d.privKey || '')}">
-                <button type="button" class="password-toggle" data-toggle="privKey">show</button>
-              </div>
-            </div>
+          <div id="creds-hidden-note" class="field-hint" style="display:${initialIcmpForced ? 'block' : 'none'};">
+            SNMPv3 credentials are hidden because this device is configured for ICMP / SNMP Trap (ping-only, no SNMP polling).
           </div>
         </form>
       </div>
@@ -259,16 +290,52 @@ const Devices = (() => {
         btn.textContent = showing ? 'show' : 'hide';
       });
     });
+
+    // Toggle the credentials block live as Config Type changes, so the
+    // person doesn't fill in SNMP creds for a device that's about to be
+    // ICMP-only (or vice versa) without realizing it'll be hidden/ignored.
+    const configSelect = overlay.querySelector('#config-type-select');
+    const credsSection = overlay.querySelector('#creds-section');
+    const credsHiddenNote = overlay.querySelector('#creds-hidden-note');
+    configSelect.addEventListener('change', () => {
+      const cfg = configSelect.value.toLowerCase();
+      const forced = cfg === 'icmp' || cfg === 'snmp trap';
+      credsSection.style.display = forced ? 'none' : 'block';
+      credsHiddenNote.style.display = forced ? 'block' : 'none';
+    });
+
+    // Live IP format feedback as the person types, rather than only at save time.
+    const ipInput = overlay.querySelector('input[name="IP"]');
+    const ipHint = overlay.querySelector('#ip-validation-hint');
+    ipInput.addEventListener('input', () => {
+      if (!ipInput.value.trim()) { ipHint.textContent = ''; return; }
+      ipHint.textContent = isValidIp(ipInput.value) ? '' : 'Doesn\u2019t look like a valid IP address.';
+      ipHint.style.color = isValidIp(ipInput.value) ? '' : 'var(--red)';
+    });
+
     if (isEdit) {
       overlay.querySelector('[data-act="delete"]').addEventListener('click', async () => { closeModal(overlay); await handleDelete(d); });
     }
     overlay.querySelector('[data-act="save"]').addEventListener('click', async () => {
       const form = overlay.querySelector('#device-form');
       if (!form.reportValidity()) return;
+      const ipValue = ipInput.value.trim();
+      if (!isValidIp(ipValue)) {
+        toast('Please enter a valid IP address', 'warn');
+        ipInput.focus();
+        return;
+      }
       const fd = new FormData(form);
       const payload = isEdit ? { id: d.id } : {};
+      const cfg = (fd.get('Config Type') || '').toLowerCase();
+      const forced = cfg === 'icmp' || cfg === 'snmp trap';
       for (const [k, v] of fd.entries()) {
-        if (!k.startsWith('tag__')) payload[k] = v;
+        if (k.startsWith('tag__')) continue;
+        // Don't send credential fields at all when they're hidden/forced
+        // ICMP -- avoids saving stale or irrelevant creds for a device
+        // that won't use them.
+        if (forced && ['snmpUser', 'authProtocol', 'authKey', 'privProtocol', 'privKey'].includes(k)) continue;
+        payload[k] = v;
       }
       payload.tags = TagFields.readFormFields(fd);
       try {
@@ -298,13 +365,7 @@ const Devices = (() => {
   };
   const FIELD_ALIASES = {
     'Collector Region': ['Collector Region', 'CollectorRegion', 'Collector_Region'],
-    'Operating Region': ['Operating Region', 'OperatingRegion'],
     'Config Type': ['Config Type', 'ConfigType'],
-    'geolocation': ['geolocation', 'Geolocation'],
-    'Region': ['Region'], 'Center': ['Center'],
-    'Device Class': ['Device Class', 'DeviceClass'],
-    'Device Category': ['Device Category', 'DeviceCategory'],
-    'Device Type': ['Device Type', 'DeviceType'],
     'Device': ['Device'], 'IP': ['IP'], 'Remarks': ['Remarks'],
   };
 
@@ -317,6 +378,30 @@ const Devices = (() => {
     downloadUrl(Api.exportDevicesUrl(), 'devices_export.xlsx')
       .then(() => toast('Devices exported', 'success'))
       .catch(e => reportError(e, 'Export failed'));
+  }
+
+  // Collector Region is the one fixed list left (everything else is a
+  // dynamic tag, handled by TagFields.registerNewValuesFromImport).
+  // Import writes whatever's in the spreadsheet's Collector Region column
+  // straight onto each device -- correct, since import needs to allow a
+  // brand-new region -- but without this, that new value would be saved
+  // on the device yet invisible in the Manage Lists dropdown, since the
+  // dropdown only shows what's actually in lists.collectorRegions.
+  async function registerNewCollectorRegionsFromImport(records) {
+    const existing = new Set(state.lists.collectorRegions || []);
+    const newValues = new Set();
+    for (const rec of records) {
+      const region = (rec['Collector Region'] || '').trim();
+      if (region && !existing.has(region)) newValues.add(region);
+    }
+    if (newValues.size === 0) return;
+    const updated = [...existing, ...newValues];
+    try {
+      await Api.setList('collectorRegions', updated);
+      state.lists.collectorRegions = updated;
+    } catch (e) {
+      console.error('Failed to register new Collector Region value(s) from import', e);
+    }
   }
 
   function openImportDialog() {
@@ -388,8 +473,11 @@ const Devices = (() => {
       const deviceTagDefs = TagFields.defsForScope('devices');
 
       const records = [];
+      let skippedInvalidIp = 0;
       for (const r of rows) {
-        if (!String(r['IP'] || '').trim()) continue;
+        const ip = String(r['IP'] || '').trim();
+        if (!ip) continue;
+        if (!isValidIp(ip)) { skippedInvalidIp++; continue; }
         const rec = {};
         for (const [field, aliases] of Object.entries(FIELD_ALIASES)) rec[field] = readAliased(r, aliases);
         rec.snmpUser = readAliased(r, CRED_ALIASES.snmpUser);
@@ -410,7 +498,11 @@ const Devices = (() => {
         importBtn.textContent = 'Importing\u2026';
         await Api.importDevices(records, mode);
         await TagFields.registerNewValuesFromImport('devices', records);
-        toast(`Imported ${records.length} device(s) (${mode})`, 'success');
+        await registerNewCollectorRegionsFromImport(records);
+        const msg = skippedInvalidIp > 0
+          ? `Imported ${records.length} device(s) (${mode}) \u2014 skipped ${skippedInvalidIp} row(s) with an invalid IP`
+          : `Imported ${records.length} device(s) (${mode})`;
+        toast(msg, skippedInvalidIp > 0 ? 'warn' : 'success');
         closeModal(overlay);
         await reloadAllData();
         render();

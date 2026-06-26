@@ -3,6 +3,8 @@
 // ============================================================================
 
 const Subnets = (() => {
+  let searchQuery = '';
+
   const FIELDS = [
     { key: 'CIDR', label: 'CIDR', required: true, placeholder: 'e.g. 10.1.1.0/24' },
     { key: 'Description', label: 'Description' },
@@ -14,18 +16,24 @@ const Subnets = (() => {
     return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/.test((value || '').trim());
   }
 
+  function filteredSubnets() {
+    if (!searchQuery) return state.subnets;
+    return state.subnets.filter(s => rowMatchesSearch(s, searchQuery));
+  }
+
   async function render() {
     const content = document.getElementById('content');
     const mode = state.viewMode.subnets;
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
-        <div class="flex gap-8 wrap">
+        <div class="flex gap-8 wrap items-center">
           <button class="btn btn-primary" id="btn-add-subnet">+ Add Subnet</button>
           <button class="btn" id="btn-import-subnets">Import from Excel</button>
           <button class="btn" id="btn-export-subnets">Export to Excel</button>
+          ${renderSearchBox('subnet-search', 'Search subnets\u2026')}
         </div>
         <div class="flex gap-12 items-center">
-          <div class="text-dim">${state.subnets.length} subnet(s)</div>
+          <div class="text-dim" id="subnet-count-label">${state.subnets.length} subnet(s)</div>
           <div class="view-toggle">
             <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
             <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
@@ -43,22 +51,33 @@ const Subnets = (() => {
     document.getElementById('btn-import-subnets').addEventListener('click', () => openImportDialog());
     document.getElementById('btn-export-subnets').addEventListener('click', handleExport);
     content.querySelectorAll('.view-toggle button').forEach(btn => {
-      btn.addEventListener('click', () => { state.viewMode.subnets = btn.dataset.mode; render(); });
+      btn.addEventListener('click', () => { state.viewMode.subnets = btn.dataset.mode; saveViewModePrefs(); render(); });
     });
+    const searchBox = document.getElementById('subnet-search');
+    searchBox.value = searchQuery;
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
   }
 
   function renderBody() {
     const body = document.getElementById('subnets-body');
+    const subnets = filteredSubnets();
+    document.getElementById('subnet-count-label').textContent =
+      searchQuery ? `${subnets.length} of ${state.subnets.length} subnet(s)` : `${state.subnets.length} subnet(s)`;
+
     if (state.subnets.length === 0) {
       body.innerHTML = emptyState({ title: 'No subnets yet', sub: 'Define a CIDR range to start tagging devices by network automatically.' });
       return;
     }
-    body.innerHTML = state.viewMode.subnets === 'card' ? renderCards() : `<div class="panel"><div class="table-wrap">${renderTable()}</div></div>`;
+    if (subnets.length === 0) {
+      body.innerHTML = emptyState({ title: 'No subnets match your search', sub: `No results for "${searchQuery}".` });
+      return;
+    }
+    body.innerHTML = state.viewMode.subnets === 'card' ? renderCards(subnets) : `<div class="panel"><div class="table-wrap">${renderTable(subnets)}</div></div>`;
     wireRowActions();
   }
 
-  function renderTable() {
-    const rows = state.subnets.map(s => `
+  function renderTable(subnets) {
+    const rows = subnets.map(s => `
       <tr data-id="${escapeHtml(s.id)}">
         <td class="mono">${escapeHtml(s.CIDR)}</td>
         <td>${escapeHtml(s.Description)}</td>
@@ -77,9 +96,9 @@ const Subnets = (() => {
     `;
   }
 
-  function renderCards() {
-    const cards = state.subnets.map(s => `
-      <div class="data-card" data-id="${escapeHtml(s.id)}">
+  function renderCards(subnets) {
+    const cards = subnets.map(s => `
+      <div class="data-card" data-id="${escapeHtml(s.id)}" data-open-detail="1">
         <div class="data-card-header">
           <div>
             <div class="data-card-title">${escapeHtml(s.CIDR)}</div>
@@ -102,6 +121,9 @@ const Subnets = (() => {
       const s = state.subnets.find(x => String(x.id) === String(id));
       el.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); openForm(s); }));
       el.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); handleDelete(s); }));
+      if (el.dataset.openDetail) {
+        el.addEventListener('click', () => openForm(s));
+      }
     });
   }
 

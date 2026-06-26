@@ -2,16 +2,29 @@
 // APP SHELL
 // ============================================================================
 
+function loadViewModePrefs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('viewModePrefs') || '{}');
+    return Object.assign({ devices: 'table', bandwidth: 'table', subnets: 'table' }, saved);
+  } catch (e) {
+    return { devices: 'table', bandwidth: 'table', subnets: 'table' };
+  }
+}
+
+function saveViewModePrefs() {
+  try { localStorage.setItem('viewModePrefs', JSON.stringify(state.viewMode)); } catch (e) { /* ignore */ }
+}
+
 const state = {
   devices: [],
   bandwidth: [],
   subnets: [],
-  lists: { collectorRegions: [], deviceClasses: [], deviceCategories: [], deviceTypes: [] },
+  lists: { collectorRegions: [] },
   tagDefs: [],
   meta: { deviceCount: 0, bandwidthCount: 0, subnetCount: 0, lastSavedAt: null, lastSavedBy: null },
   currentView: 'dashboard',
   lastGenerateResult: null,
-  viewMode: { devices: 'table', bandwidth: 'table', subnets: 'table' }, // 'table' | 'card'
+  viewMode: loadViewModePrefs(), // 'table' | 'card', persisted per-section
 };
 
 const VIEWS = [
@@ -115,7 +128,7 @@ async function reloadAllData() {
   state.devices = devicesRes.devices || [];
   state.bandwidth = bwRes.rows || [];
   state.subnets = subnetsRes.subnets || [];
-  state.lists = Object.assign({ collectorRegions: [], deviceClasses: [], deviceCategories: [], deviceTypes: [] }, listsRes.lists || {});
+  state.lists = Object.assign({ collectorRegions: [] }, listsRes.lists || {});
   state.tagDefs = tagsRes.tagDefs || [];
 }
 

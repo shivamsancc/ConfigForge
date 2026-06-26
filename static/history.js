@@ -3,23 +3,48 @@
 // ============================================================================
 
 const History = (() => {
+  let searchQuery = '';
+  let cachedEntries = [];
+
   async function render() {
     const content = document.getElementById('content');
     content.innerHTML = `<div class="loading-row"><div class="spinner"></div> Loading history&hellip;</div>`;
-    let entries = [];
     try {
       const res = await Api.getHistory(100);
-      entries = res.entries || [];
+      cachedEntries = res.entries || [];
     } catch (e) {
       reportError(e, 'Failed to load history');
       content.innerHTML = emptyState({ title: 'Could not load history' });
       return;
     }
-    if (entries.length === 0) {
+    if (cachedEntries.length === 0) {
       content.innerHTML = emptyState({ title: 'No generations yet', sub: 'Run "Generate YAML" to create the first entry.' });
       return;
     }
     content.innerHTML = `
+      <div class="flex justify-between items-center mb-16">
+        ${renderSearchBox('history-search', 'Search history\u2026')}
+        <div class="text-dim" id="history-count-label"></div>
+      </div>
+      <div id="history-body"></div>
+    `;
+    const searchBox = document.getElementById('history-search');
+    searchBox.value = searchQuery;
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
+    renderBody();
+  }
+
+  function renderBody() {
+    const body = document.getElementById('history-body');
+    const entries = searchQuery ? cachedEntries.filter(e => rowMatchesSearch(e, searchQuery)) : cachedEntries;
+    document.getElementById('history-count-label').textContent =
+      searchQuery ? `${entries.length} of ${cachedEntries.length} entries` : `${cachedEntries.length} entries`;
+
+    if (entries.length === 0) {
+      body.innerHTML = emptyState({ title: 'No entries match your search', sub: `No results for "${searchQuery}".` });
+      return;
+    }
+    body.innerHTML = `
       <div class="panel"><div class="table-wrap">
         <table>
           <thead><tr><th>Timestamp</th><th>Actor</th><th>Summary</th><th></th></tr></thead>
@@ -36,7 +61,7 @@ const History = (() => {
         </table>
       </div></div>
     `;
-    document.querySelectorAll('#content tbody tr').forEach(tr => {
+    document.querySelectorAll('#history-body tbody tr').forEach(tr => {
       tr.querySelector('[data-act="view"]').addEventListener('click', () => openEntry(tr.dataset.id));
     });
   }
