@@ -22,7 +22,7 @@ import handler
 
 
 def parse_args():
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.abspath(__file__)) + "/db/"
     p = argparse.ArgumentParser(
         description="ConfigForge -- shared SNMP collector config YAML generator",
     )
