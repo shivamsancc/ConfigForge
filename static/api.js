@@ -35,15 +35,15 @@ const Api = (() => {
   return {
     // Devices
     getDevices: () => request('GET', '/api/devices'),
-    saveDevice: (device) => request('POST', '/api/devices', withActor(device)),
+    saveDevice: (device) => request('POST', '/api/devices', withActor({ device })),
     deleteDevice: (id) => request('DELETE', `/api/devices/${encodeURIComponent(id)}?_actor=${encodeURIComponent(getEditorName())}`),
     importDevices: (devices, mode) => request('POST', '/api/devices/import', withActor({ devices, mode })),
 
     // Bandwidth
     getBandwidth: () => request('GET', '/api/bandwidth'),
-    saveBandwidth: (row) => request('POST', '/api/bandwidth', withActor(row)),
+    saveBandwidth: (row) => request('POST', '/api/bandwidth', withActor({ row })),
     deleteBandwidth: (id) => request('DELETE', `/api/bandwidth/${encodeURIComponent(id)}?_actor=${encodeURIComponent(getEditorName())}`),
-    importBandwidth: (rows, mode) => request('POST', '/api/bandwidth/import', withActor({ devices: rows, mode })),
+    importBandwidth: (rows, mode) => request('POST', '/api/bandwidth/import', withActor({ rows, mode })),
 
     // Lists
     getLists: () => request('GET', '/api/lists'),

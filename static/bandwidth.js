@@ -137,7 +137,7 @@ const Bandwidth = (() => {
       if (!payload.customTags) payload.customTags = [];
       try {
         const saved = await Api.saveBandwidth(payload);
-        const newRow = saved.bandwidth || saved.device || saved;
+        const newRow = saved.row || saved;
         if (isEdit) {
           state.bandwidth = state.bandwidth.map(r => r.id === b.id ? newRow : r);
         } else {
@@ -234,7 +234,7 @@ const Bandwidth = (() => {
         toast(`Imported ${records.length} row(s) (${mode})`, 'success');
         closeModal(overlay);
         const fresh = await Api.getBandwidth();
-        state.bandwidth = fresh.bandwidth || fresh.devices || [];
+        state.bandwidth = fresh.rows || [];
         render();
         refreshCounts();
       } catch (e) {
