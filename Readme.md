@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="/static/logo.svg" alt="ConfigForge" width="420">
+  <img src="/static/logo.svg" alt="ConfigForge" width="100%">
 </p>
 
 <p align="center">
