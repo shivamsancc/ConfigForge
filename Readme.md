@@ -11,9 +11,8 @@
 </p>
 
 <p align="center">
-  A shared, self-hosted tool for generating Datadog SNMP/ICMP collector config YAML<br>
-  from a team-maintained inventory of network devices, bandwidth caps, and subnets &mdash;<br>
-  with a fully dynamic tagging system and a live, zoomable diagram of how it all connects.
+  A shared, self-hosted tool for generating Datadog SNMP/ICMP collector config YAML
+  from a team-maintained inventory of network devices, bandwidth caps, and subnets.
 </p>
 
 ---
@@ -26,7 +25,47 @@ runs it on an always-on machine, and everyone on the team opens it in a browser 
 manage the same dataset together &mdash; no per-person spreadsheet copies, no merge
 conflicts, no "whose version is current?"
 
+What you get instead of a spreadsheet: multi-user access from one shared dataset,
+input validation (IP/CIDR format, credential fields), an audit log of who changed
+what, and YAML generation that's always derived from current data instead of
+copy-pasted by hand. What you give up: there's no offline editing without the
+server running, and if your team lives in pivot tables and conditional formatting,
+this won't replace that workflow &mdash; it replaces the "this is also our source of
+truth for monitoring config" part of it.
+
+## Quickstart
+
+```bash
+python3 server.py
+```
+
+That's it. This starts the server on port 8420 with a local `configforge.db` file
+next to the script, and opens your default browser to it automatically.
+
+From the empty dashboard, three steps to your first generated file:
+
+1. **Manage Lists** &rarr; add a Collector Region (e.g. `aws-mumbai`).
+2. **Devices** &rarr; add a device, assign it that Collector Region.
+3. **Generate YAML** &rarr; click Generate. You now have a YAML file derived from
+   that device.
+
+To point it at a shared network drive so a whole team shares one dataset, or to
+change the port:
+
+```bash
+python3 server.py --db /path/to/shared/configforge.db --port 8420
+```
+
+Run `python3 server.py --help` for the full list of options (`--host`,
+`--no-browser`, etc).
+
+**Requirements:** Python 3.8+. Nothing else &mdash; no `pip install` needed.
+
 ## Features
+
+> A screenshot of the Dashboard and the Network Tree belongs here. Neither is in
+> this revision yet &mdash; treat the descriptions below as unverified until you've
+> run it yourself.
 
 ### Inventory management
 
@@ -49,40 +88,6 @@ conflicts, no "whose version is current?"
   or replace mode. Credential column headers are alias-tolerant (`Auth Key`,
   `authKey`, `AuthKey` all map to the same field).
 
-### Network Tree
-
-A live, zoomable diagram of your whole network &mdash; Subnets on the left,
-branching to the Devices inside each one, branching to that device's Bandwidth
-Capping rows on the right. It's a real spatial diagram, not a list: cards
-connected by curved lines, built for exploring hundreds of devices without
-getting lost.
-
-- **Pan and zoom, Google-Maps style** &mdash; scroll or pinch to zoom in on the
-  cursor, click-drag the background to pan, with on-screen +/&minus;/reset
-  controls. Each column also scrolls independently within itself, so a bucket
-  with hundreds of devices stays fully navigable without the whole diagram
-  becoming unusably tall.
-- **Click to drill in, click again for details** &mdash; click a subnet to reveal
-  its devices; click a device to reveal its bandwidth rows. Click the
-  already-selected card again to open a details panel with an **Edit** button,
-  which opens the exact same edit form used everywhere else in the app &mdash;
-  editing from the diagram updates your data immediately, without leaving the
-  page.
-- **Hover to trace a connection** &mdash; hovering a subnet or device highlights
-  the connector lines down to everything beneath it, animated with a flowing-dash
-  effect so you can see at a glance which devices and bandwidth rows belong to
-  what.
-- **At-a-glance bandwidth indicator** &mdash; every device card shows a small
-  badge: a green count if it has bandwidth capping configured, a muted dash if it
-  doesn't.
-- **Unassigned buckets** &mdash; devices whose IP doesn't fall inside any subnet,
-  and bandwidth rows whose IP doesn't match any device, show up in their own
-  clearly-marked buckets rather than disappearing silently.
-- **Filter bar with `key:value` queries** &mdash; type something like
-  `collector_region:india` or `country:"AWS US"` (quote multi-word values), or
-  use the dropdowns next to it for the same filters without typing. Filtering
-  narrows which subnets/devices appear; it never changes the diagram's shape.
-
 ### Dynamic tags
 
 - **Collector Region is the one fixed concept** &mdash; mandatory, and it's what
@@ -98,14 +103,41 @@ getting lost.
 - **Tags render as real columns** &mdash; each tag shows up as its own column in
   every table (header = tag name, cell = value or empty), not packed into one
   generic "Tags" column.
-- **Subnet-based tag inheritance** &mdash; tag a subnet by CIDR, and any device
-  whose IP falls inside that range automatically inherits the tag for any value it
-  doesn't already set itself. The matched subnet is also written into the
-  generated YAML (`subnet: 10.1.1.0/24`) so it's traceable from the output alone.
-- **Dependency-checked deletion** &mdash; removing a tag, a tag value, or a
-  Collector Region that's still in use warns you with the affected record count
-  before letting you proceed. Deleting a tag definition never deletes the records
-  that used it &mdash; only the tag reference on them.
+- **Subnet-based tag inheritance** &mdash; tag a subnet once by CIDR instead of
+  tagging every device in it individually. Any device whose IP falls inside that
+  range inherits the tag for any value it doesn't already set itself, and the
+  matched subnet is written into the generated YAML (`subnet: 10.1.1.0/24`) so
+  it's traceable from the output alone.
+- **Deleting something in use asks first.** Removing a tag, a tag value, or a
+  Collector Region that's still referenced warns you with the affected record
+  count before letting you proceed, and deleting a tag definition never deletes
+  the records that used it &mdash; only the tag reference on them. (Same rule
+  applies to the `DELETE /api/tags/{id}` endpoint &mdash; see REST API below.)
+
+### Network Tree
+
+Browsing hundreds of devices as a flat table makes it hard to see how your
+network is actually laid out. The Network Tree is a spatial diagram instead:
+Subnets on the left, branching to the Devices inside each one, branching to
+that device's Bandwidth Capping rows on the right &mdash; built so you can pan
+and zoom around a few hundred devices without losing your place.
+
+- **Pan and zoom, Google-Maps style**, with independent scrolling per column so
+  a bucket with hundreds of devices doesn't make the whole diagram unusably
+  tall.
+- **Click a card to drill in** (subnet &rarr; its devices &rarr; their
+  bandwidth rows); click the already-selected card again for a details panel
+  with an **Edit** button that opens the same form used everywhere else in the
+  app. Editing from the diagram updates your data immediately.
+- **Hover to trace a connection** &mdash; highlights the connector lines down
+  to everything beneath the card you're hovering, so you can see at a glance
+  what belongs to what.
+- **Unassigned buckets** for devices with no matching subnet and bandwidth rows
+  with no matching device, instead of either disappearing silently.
+- **Filter with `key:value` queries** (`collector_region:india`,
+  `country:"AWS US"` &mdash; quote multi-word values) or the dropdowns next to
+  the filter bar. Filtering narrows what's shown; it never changes the
+  diagram's shape.
 
 ### Everything else
 
@@ -130,26 +162,33 @@ getting lost.
   [Upgrading](#upgrading) below) &mdash; updating to a new version is just
   "copy in the new files, restart."
 
-## Quickstart
+## Limitations and non-goals
 
-```bash
-python3 server.py
-```
+Things ConfigForge deliberately does not try to be, so you can decide quickly
+whether it fits:
 
-That's it. This starts the server on port 8420 with a local `configforge.db` file
-next to the script, and opens your default browser to it automatically.
-
-To point it at a shared network drive so a whole team shares one dataset, or to
-change the port:
-
-```bash
-python3 server.py --db /path/to/shared/configforge.db --port 8420
-```
-
-Run `python3 server.py --help` for the full list of options (`--host`,
-`--no-browser`, etc).
-
-**Requirements:** Python 3.8+. Nothing else &mdash; no `pip install` needed.
+- **Not a CMDB.** It tracks the fields needed to generate monitoring config
+  (IP, region, credentials, a handful of tags) &mdash; it doesn't model
+  ownership, lifecycle, warranty, or asset relationships beyond
+  subnet/device/bandwidth.
+- **No RBAC.** Anyone who can reach the server can read and write everything.
+  The "editor name" prompt is for audit-log attribution, not access control.
+- **No authentication on the API.** Same caveat as the credentials section
+  below &mdash; if you need real access control, put this behind a reverse
+  proxy or VPN.
+- **Single shared SQLite file, no locking beyond SQLite's own WAL mode.**
+  Two people editing the same record at the same moment: last write wins,
+  there's no optimistic-locking or conflict warning. For the team-sized usage
+  this was built for (a handful of people maintaining a shared inventory,
+  not editing the same device simultaneously) this hasn't been a problem in
+  practice, but it's not battle-tested under heavy concurrent write load and
+  you should know that going in.
+- **No automated test suite is committed to the repo yet.** Every module here
+  was verified by hand during development &mdash; `yamldump.py` and
+  `aesgcm.py` against PyYAML and pycryptodome across thousands of randomized
+  trials, the frontend against a real browser driving real interactions. None
+  of that is currently captured as a repeatable `tests/` directory you can
+  run yourself. Contributions that add one are very welcome.
 
 ## Upgrading
 
@@ -172,18 +211,30 @@ migration that made that change automatically promoted every value already in us
 into a real tag definition and rewrote each device's stored data to match &mdash;
 nothing was lost, and no manual cleanup was required.
 
-## How credentials are protected
+## Security
 
 SNMPv3 `authKey`/`privKey` values are encrypted at rest with AES-256-GCM, using a
 key embedded in `storage.py`. This protects the raw `.db` file itself (e.g. if
 someone copies it off a shared drive or finds it in a backup) but is **not** an
 access-control mechanism for the running app &mdash; anyone who can reach the
 server's HTTP port can use it normally, the same way anyone with the original
-spreadsheet could read it. This is a deliberate, documented tradeoff in favor of
-staying simple and dependency-free; if your environment needs real authentication,
-put ConfigForge behind a reverse proxy or VPN.
+spreadsheet could read it. There's no authentication on the API, no rate
+limiting, and no RBAC (see [Limitations and non-goals](#limitations-and-non-goals)
+above). This is a deliberate, documented tradeoff in favor of staying simple and
+dependency-free; if your environment needs real authentication, put ConfigForge
+behind a reverse proxy or VPN.
 
 ## Architecture
+
+The backend is split by responsibility, not by layer convention: `logic.py` holds
+the actual device-to-YAML conversion as pure functions with no HTTP or database
+code in it, specifically so it can be reasoned about (and tested) without spinning
+up a server. `storage.py` is the only file that touches SQLite. `handler.py` is
+the only file that knows about HTTP. If you're adding a new entity type alongside
+Devices/Bandwidth/Subnets, the pattern to follow is: a table in `storage.py`, a
+migration in `migrations.py`, routes in `handler.py`, a `<name>.js` view that
+follows the same shape as `subnets.js` (the simplest existing example), and tag
+support via `tagfields.js` if it should be taggable.
 
 ```
 server.py          entry point -- argument parsing, runs migrations, opens the browser, starts the HTTP server
@@ -237,9 +288,15 @@ contract.
 
 ## Contributing
 
-Issues and pull requests are welcome at
+This is a young project &mdash; I'm the sole maintainer so far. Issues and pull
+requests are welcome at
 [github.com/shivamsancc/ConfigForge](https://github.com/shivamsancc/ConfigForge).
-A few things worth knowing before you dive in:
+
+The project optimizes for running on locked-down, offline, single-team
+infrastructure over almost anything else. If a PR trades that away for
+convenience &mdash; a new pip dependency, a build step, an assumption that the
+internet is reachable &mdash; expect pushback on the tradeoff, not the code
+itself. A few more specific things worth knowing before you dive in:
 
 - **Any schema change goes in `migrations.py`**, never as an ad-hoc `ALTER` in
   `storage.py`. Add a new numbered `migrate_N` function; never edit an existing
