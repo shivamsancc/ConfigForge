@@ -27,8 +27,8 @@ import time
 import uuid
 import ipaddress
 
-import aesgcm
-import migrations
+from core import aesgcm
+from core import migrations
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection = None

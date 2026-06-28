@@ -55,10 +55,8 @@ import ipaddress
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
-import storage
-import logic
-import yamldump
-import xlsxwriter
+from core import storage, logic
+from formats import yamldump, xlsxwriter
 
 STATIC_DIR = None  # set by server.py before serving
 

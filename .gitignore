@@ -1,0 +1,40 @@
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Runtime database files
+# The db/ directory is tracked (it documents where databases live),
+# but the database files themselves are runtime artifacts.
+db/*.db
+db/*.db-wal
+db/*.db-shm
+
+# Any stray database files at the repository root or in tools/
+*.db
+*.db-wal
+*.db-shm
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor / IDE artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Integration runtime state (each integration manages its own artifacts)
+integrations/**/__pycache__/
+integrations/**/*.pyc
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Example databases (committed intentionally should be listed as exceptions)
+# examples/*.db  ← uncomment and list specific files if you commit sample DBs

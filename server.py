@@ -17,8 +17,8 @@ import time
 import webbrowser
 from http.server import ThreadingHTTPServer
 
-import storage
-import handler
+from core import storage
+from core import handler
 
 
 def parse_args():
