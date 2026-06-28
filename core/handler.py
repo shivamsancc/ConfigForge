@@ -50,8 +50,10 @@ bandwidth/subnets rows themselves have no cross-table dependents in this
 schema, so their DELETE is unconditional.
 """
 import json
+import os
 import re
 import ipaddress
+import traceback
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -163,12 +165,10 @@ class Handler(BaseHTTPRequestHandler):
 
             return self._serve_static(path)
         except Exception as e:
-            import traceback
             traceback.print_exc()
             return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
 
     def _serve_static(self, path):
-        import os
         if path == "/":
             path = "/index.html"
         full = os.path.normpath(os.path.join(STATIC_DIR, path.lstrip("/")))
@@ -239,7 +239,6 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._send_json({"error": str(e)}, 400)
         except Exception as e:
-            import traceback
             traceback.print_exc()  # full traceback to the server console
             return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
 
@@ -403,7 +402,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return self._send_json({"error": "not found"}, 404)
         except Exception as e:
-            import traceback
             traceback.print_exc()
             return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
 

@@ -1,68 +1,146 @@
 # Tests
 
 This directory is reserved for ConfigForge's automated test suite.
+No test code exists yet — this is a known gap explicitly called out in the
+project README. Contributions are welcome.
 
-The README acknowledges this as a known gap and welcomes contributions.
-The modules most in need of tests, in priority order:
+---
 
-## Priority 1 — Pure functions (no mocks needed)
+## Philosophy
 
-**`core/logic.py`** — `convert_to_collector_configs` is the most important
-function in the project: it is the only place that turns inventory data into
-YAML config. It accepts plain dicts and returns plain dicts, making it trivially
-testable without a database or HTTP server.
+ConfigForge's test philosophy mirrors its architecture:
 
-Suggested coverage:
-- Device with full SNMPv3 creds → appears in correct region file
-- Device missing Collector Region → appears in `missingRegionDevices`
-- Device with ICMP Config Type → `mode: icmp`, no SNMP fields
-- Bandwidth row matched to device by IP → `interface_configs` populated
-- Subnet inheritance → device without tag inherits tag from matching subnet
-- Overlapping subnets → most-specific (longest prefix) wins
+- **Prefer unit tests over integration tests.** Most of the interesting logic
+  (`core/logic.py`, `formats/yamldump.py`, `core/aesgcm.py`) is pure functions
+  that take plain Python values and return plain Python values. They can be
+  tested without a database, without a running server, and without mocking
+  anything.
 
-**`formats/yamldump.py`** — Already verified by hand against PyYAML across
-thousands of randomized inputs. A regression test should capture that behavior:
-run `dump()` and `yaml.dump()` (if PyYAML is available) on the same input and
-assert byte-for-byte identity for all types the project actually writes.
+- **Use the standard library.** Tests run with `python3 -m unittest` — no test
+  runner install required. `pytest` is supported as an optional alternative but
+  must not be required.
 
-**`formats/xlsxwriter.py`** — Write a file, open it with SheetJS or openpyxl
-(test-only dep), verify headers and cell values round-trip correctly.
+- **Tests must pass offline.** No network calls. No external services. No pip
+  packages that are not already available on the machine.
 
-**`core/aesgcm.py`** — Encrypt/decrypt round-trip, tamper detection (flip one
-byte in the ciphertext, expect `ValueError`), wrong key detection.
+- **Tests document expected behavior.** A failing test should tell you exactly
+  what contract was violated, not just that something broke.
 
-## Priority 2 — Storage layer (requires a temp SQLite file)
+---
 
-**`core/storage.py`** — Use `tempfile.mkstemp()` for an isolated test database,
-run `storage.init()`, then verify CRUD operations and credential encryption.
+## Recommended directory layout
 
-**`core/migrations.py`** — Apply all migrations to a fresh database and confirm
-the final schema matches expectations. Also test idempotency: run migrations
-twice and confirm no error.
+Mirror the package structure. Each subdirectory covers one area of the codebase:
 
-## Priority 3 — Integration tests (requires a running server)
+```
+tests/
+    storage/
+        test_devices.py       CRUD, encryption round-trip, replace/merge modes
+        test_bandwidth.py
+        test_subnets.py
+        test_tags.py
+        test_audit.py
+        test_history.py
+        test_migrations.py    Apply all migrations to a temp DB; test idempotency
+    logic/
+        test_convert.py       convert_to_collector_configs: SNMP, ICMP, subnet inheritance
+        test_validation.py    is_valid_ip, normalize_group_key, should_be_icmp_only
+    handler/
+        test_devices_api.py   HTTP round-trips: GET/POST/DELETE /api/devices
+        test_generate_api.py  POST /api/generate, verify YAML in response
+        test_export_api.py    GET /api/export/devices.xlsx, verify ZIP magic bytes
+    formats/
+        test_yamldump.py      dump() against PyYAML (if available); edge cases
+        test_xlsxwriter.py    write_xlsx(); verify headers and cell values round-trip
+        test_aesgcm.py        encrypt/decrypt round-trip; tamper detection; wrong key
+    integration/
+        README.md             Future end-to-end tests (start server, drive with http.client)
+```
 
-**`core/handler.py`** — Start a `ThreadingHTTPServer` on a random port in a
-`setUp` fixture, drive it with `http.client`, assert JSON responses. This
-covers the full stack end-to-end.
+Each file follows `test_<module>.py` naming so `unittest discover` picks them
+up automatically.
+
+---
 
 ## Running tests
 
-No test runner is required — Python's built-in `unittest` framework is
-sufficient:
+No configuration needed. From the repository root:
 
 ```bash
+# Run all tests
 python3 -m unittest discover tests/
+
+# Run one subdirectory
+python3 -m unittest discover tests/logic/
+
+# Run one file
+python3 -m unittest tests/formats/test_yamldump.py
+
+# With pytest (optional)
+pytest tests/
 ```
 
-If `pytest` is available it will also discover and run the same files with no
-configuration needed.
+---
 
-## Conventions
+## Writing a test
 
-- One file per module under test: `test_logic.py`, `test_yamldump.py`, etc.
-- Test classes inherit from `unittest.TestCase`.
-- No pip dependencies in test files except `pytest` (optional) and `openpyxl`
-  (optional, for XLSX round-trip tests). Guard optional deps with
-  `@unittest.skipUnless(...)`.
-- Tests must pass offline with no internet access.
+```python
+# tests/logic/test_validation.py
+import unittest
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+from core.logic import is_valid_ip, normalize_group_key
+
+
+class TestIsValidIp(unittest.TestCase):
+
+    def test_valid_ipv4(self):
+        self.assertTrue(is_valid_ip('10.0.0.1'))
+
+    def test_invalid_string(self):
+        self.assertFalse(is_valid_ip('not-an-ip'))
+
+    def test_empty_string(self):
+        self.assertFalse(is_valid_ip(''))
+
+
+class TestNormalizeGroupKey(unittest.TestCase):
+
+    def test_spaces_become_underscores(self):
+        self.assertEqual(normalize_group_key('AWS Mumbai'), 'aws_mumbai')
+
+    def test_leading_trailing_stripped(self):
+        self.assertEqual(normalize_group_key('  eu-west  '), 'eu_west')
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+---
+
+## Test priorities
+
+In rough priority order, these are the areas that would benefit most from
+automated coverage:
+
+1. **`core/logic.py`** — The YAML generation pipeline is the most critical
+   path in the project. Pure functions, no mocks needed.
+
+2. **`core/aesgcm.py`** — Encryption correctness. Tamper detection must raise.
+   Wrong-key decryption must not silently return garbage.
+
+3. **`formats/yamldump.py`** — Byte-for-byte comparison against PyYAML
+   (guarded by `@unittest.skipUnless(importlib.util.find_spec('yaml'), 'PyYAML not installed')`).
+
+4. **`core/migrations.py`** — Apply all migrations to a fresh temp database;
+   verify the final schema; confirm running migrations twice is a no-op.
+
+5. **`core/storage.py`** — CRUD for every entity type using a temp SQLite file
+   (`tempfile.mkstemp(suffix='.db')`). Tear down in `tearDown`.
+
+6. **`core/handler.py`** — HTTP-level tests using `http.client` against a
+   server started on a random ephemeral port in `setUpClass`. These are slower
+   and depend on the storage layer, so they belong in the integration bucket.
