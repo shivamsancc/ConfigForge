@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/logo.svg" alt="ConfigForge" width="420">
+  <img src="logo.svg" alt="ConfigForge" width="420">
 </p>
 
 <p align="center">
