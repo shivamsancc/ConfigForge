@@ -4,6 +4,7 @@
 
 const Bandwidth = (() => {
   let searchQuery = '';
+  const tc = TableControls.create('bandwidth');
 
   const FIELDS = [
     { key: 'IP', label: 'IP', required: true },
@@ -26,16 +27,16 @@ const Bandwidth = (() => {
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
         <div class="flex gap-8 wrap items-center">
-          <button class="btn btn-primary" id="btn-add-bw">+ Add Row</button>
-          <button class="btn" id="btn-import-bw">Import from Excel</button>
-          <button class="btn" id="btn-export-bw">Export to Excel</button>
+          <button class="btn btn-primary" id="btn-add-bw">${icon('plus', { size: 14 })} Add Row</button>
+          <button class="btn" id="btn-import-bw">${icon('import', { size: 14 })} Import from Excel</button>
+          <button class="btn" id="btn-export-bw">${icon('export', { size: 14 })} Export to Excel</button>
           ${renderSearchBox('bw-search', 'Search bandwidth rows\u2026')}
         </div>
         <div class="flex gap-12 items-center">
           <div class="text-dim" id="bw-count-label">${state.bandwidth.length} row(s)</div>
           <div class="view-toggle">
-            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
-            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
+            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">${icon('table', { size: 14 })} Table</button>
+            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">${icon('grid', { size: 14 })} Cards</button>
           </div>
         </div>
       </div>
@@ -50,8 +51,12 @@ const Bandwidth = (() => {
     });
     const searchBox = document.getElementById('bw-search');
     searchBox.value = searchQuery;
-    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; tc.resetPage(); renderBody(); });
   }
+
+  const SORT_RESOLVERS = {
+    'Allocated BW': (b) => parseBwToBps(b['Allocated BW']) ?? -1,
+  };
 
   function renderBody() {
     const body = document.getElementById('bw-body');
@@ -67,8 +72,21 @@ const Bandwidth = (() => {
       body.innerHTML = emptyState({ title: 'No rows match your search', sub: `No results for "${searchQuery}".` });
       return;
     }
-    body.innerHTML = state.viewMode.bandwidth === 'card' ? renderCards(rows) : `<div class="panel"><div class="table-wrap">${renderTable(rows)}</div></div>`;
+
+    const resolvers = { ...SORT_RESOLVERS, ...TagFields.tagSortResolvers('bandwidth') };
+    if (state.viewMode.bandwidth === 'card') {
+      const { pageRows, controlsHtml } = tc.apply(rows, resolvers);
+      body.innerHTML = `${renderCards(pageRows)}<div class="panel" style="margin-top:12px;">${controlsHtml}</div>`;
+      wireRowActions();
+      tc.wirePager(body, renderBody);
+      return;
+    }
+
+    const { pageRows, controlsHtml } = tc.apply(rows, resolvers);
+    body.innerHTML = `<div class="panel"><div class="table-wrap">${renderTable(pageRows)}</div>${controlsHtml}</div>`;
     wireRowActions();
+    tc.wireHeaders(body, renderBody);
+    tc.wirePager(body, renderBody);
   }
 
   function renderTable(rows) {
@@ -81,7 +99,7 @@ const Bandwidth = (() => {
         <td>${escapeHtml(b.Center)}</td>
         <td>${escapeHtml(b['Link Type'])}</td>
         <td>${escapeHtml(b.Interface_description)}</td>
-        <td>${TagFields.renderBadges('bandwidth', b.tags) || '<span class="text-faint">&mdash;</span>'}</td>
+        ${TagFields.renderTableCells('bandwidth', b.tags)}
         <td>
           <button class="btn btn-sm" data-act="edit">Edit</button>
           <button class="btn btn-sm btn-danger" data-act="delete">Delete</button>
@@ -91,8 +109,10 @@ const Bandwidth = (() => {
     return `
       <table>
         <thead><tr>
-          <th>IP</th><th>Interface</th><th>Allocated BW</th><th>Region</th>
-          <th>Center</th><th>Link Type</th><th>Interface Description</th><th>Tags</th><th></th>
+          ${tc.sortableHeader('IP', 'IP')}${tc.sortableHeader('Interface', 'Interface')}${tc.sortableHeader('Allocated BW', 'Allocated BW')}${tc.sortableHeader('Region', 'Region')}
+          ${tc.sortableHeader('Center', 'Center')}${tc.sortableHeader('Link Type', 'Link Type')}${tc.sortableHeader('Interface Description', 'Interface_description')}
+          ${TagFields.renderTableHeaders('bandwidth', tc)}
+          <th></th>
         </tr></thead>
         <tbody>${trs}</tbody>
       </table>
@@ -141,7 +161,7 @@ const Bandwidth = (() => {
       await Api.deleteBandwidth(row.id);
       state.bandwidth = state.bandwidth.filter(b => b.id !== row.id);
       toast('Row deleted', 'success');
-      render();
+      if (state.currentView === 'bandwidth') render();
       refreshCounts();
     } catch (e) {
       reportError(e, 'Delete failed');
@@ -215,7 +235,7 @@ const Bandwidth = (() => {
         else state.bandwidth.push(newRow);
         toast(isEdit ? 'Row updated' : 'Row added', 'success');
         closeModal(overlay);
-        render();
+        if (state.currentView === 'bandwidth') render();
         refreshCounts();
       } catch (e) {
         reportError(e, 'Save failed');
@@ -332,5 +352,5 @@ const Bandwidth = (() => {
     });
   }
 
-  return { render };
+  return { render, _openFormExternal: openForm };
 })();

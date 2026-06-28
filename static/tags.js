@@ -1,7 +1,9 @@
 // ============================================================================
-// MANAGE TAGS VIEW -- the dynamic tag system.
+// MANAGE TAGS VIEW -- create and define tags.
 // A tag def is {id, name, scopes: [devices|bandwidth|subnets], values: [...]}.
-// A tag scoped to multiple sections shares one value list across all of them.
+// This page handles creating a tag and choosing which sections it applies
+// to. Editing the tag's VALUE LIST happens on Manage Lists instead, so
+// every value list (Collector Region plus every tag) lives in one place.
 // ============================================================================
 
 const Tags = (() => {
@@ -11,12 +13,20 @@ const Tags = (() => {
     const content = document.getElementById('content');
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16">
-        <button class="btn btn-primary" id="btn-add-tag">+ New Tag</button>
+        <button class="btn btn-primary" id="btn-add-tag">${icon('plus', { size: 14 })} New Tag</button>
         <div class="text-dim">${state.tagDefs.length} tag(s) defined</div>
+      </div>
+      <div class="banner banner-info mb-16">
+        <span>${icon('info', { size: 16 })}</span>
+        <div class="banner-content">
+          This page creates a tag and chooses which sections it applies to. To add or remove its values,
+          use <button class="link" data-nav="lists">Manage Lists</button> once it's created.
+        </div>
       </div>
       <div id="tags-body"></div>
     `;
     document.getElementById('btn-add-tag').addEventListener('click', () => openTagForm(null));
+    content.querySelectorAll('[data-nav]').forEach(el => el.addEventListener('click', () => navigateTo(el.dataset.nav)));
     renderBody();
   }
 
@@ -29,101 +39,39 @@ const Tags = (() => {
       });
       return;
     }
-    body.innerHTML = state.tagDefs.map(td => renderTagCard(td)).join('');
+    body.innerHTML = `<div class="card-grid">${state.tagDefs.map(td => renderTagCard(td)).join('')}</div>`;
     wireCardActions();
   }
 
   function renderTagCard(td) {
     const scopeBadges = (td.scopes || []).map(s => `<span class="badge badge-violet">${escapeHtml(SCOPE_LABELS[s] || s)}</span>`).join(' ');
+    const valueCount = (td.values || []).length;
     return `
-      <div class="tag-def-card" data-id="${escapeHtml(td.id)}">
-        <div class="flex justify-between items-center mb-12">
+      <div class="data-card" data-id="${escapeHtml(td.id)}">
+        <div class="data-card-header">
           <div>
-            <div style="font-weight:650;font-size:14.5px;">${escapeHtml(td.name)}</div>
-            <div class="flex gap-8 mb-12" style="margin-top:6px;">${scopeBadges}</div>
-          </div>
-          <div class="flex gap-8">
-            <button class="btn btn-sm" data-act="edit-name">Edit</button>
-            <button class="btn btn-sm btn-danger" data-act="delete-tag">Delete Tag</button>
+            <div class="data-card-title">${escapeHtml(td.name)}</div>
+            <div class="data-card-sub">${valueCount} value${valueCount === 1 ? '' : 's'}</div>
           </div>
         </div>
-        <div class="list-chip-row" id="chips-${escapeHtml(td.id)}"></div>
-        <div class="add-row">
-          <input type="text" id="add-input-${escapeHtml(td.id)}" placeholder="Add a value to ${escapeHtml(td.name)}&hellip;">
-          <button class="btn btn-primary btn-sm" data-act="add-value">Add</button>
+        <div class="data-card-meta">${scopeBadges}</div>
+        <div class="data-card-actions">
+          <button class="btn btn-sm" data-act="edit">Edit</button>
+          <button class="btn btn-sm" data-act="manage-values">Manage Values</button>
+          <button class="btn btn-sm btn-danger" data-act="delete-tag">Delete</button>
         </div>
       </div>
     `;
   }
 
   function wireCardActions() {
-    state.tagDefs.forEach(td => {
-      renderChips(td);
-      const card = document.querySelector(`.tag-def-card[data-id="${td.id}"]`);
-      if (!card) return;
-      card.querySelector('[data-act="edit-name"]').addEventListener('click', () => openTagForm(td));
+    document.querySelectorAll('#tags-body [data-id]').forEach(card => {
+      const td = state.tagDefs.find(t => t.id === card.dataset.id);
+      if (!td) return;
+      card.querySelector('[data-act="edit"]').addEventListener('click', () => openTagForm(td));
       card.querySelector('[data-act="delete-tag"]').addEventListener('click', () => handleDeleteTagDef(td));
-      card.querySelector('[data-act="add-value"]').addEventListener('click', () => handleAddValue(td));
-      const input = document.getElementById(`add-input-${td.id}`);
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddValue(td); } });
+      card.querySelector('[data-act="manage-values"]').addEventListener('click', () => navigateTo('lists'));
     });
-  }
-
-  function renderChips(td) {
-    const container = document.getElementById(`chips-${td.id}`);
-    const items = td.values || [];
-    if (items.length === 0) {
-      container.innerHTML = `<span class="text-faint" style="font-size:12.5px;">No values yet.</span>`;
-      return;
-    }
-    container.innerHTML = items.map(v => `
-      <span class="list-chip">
-        ${escapeHtml(v)}
-        <button data-remove-value="${escapeHtml(v)}" title="Remove">&times;</button>
-      </span>
-    `).join('');
-    container.querySelectorAll('[data-remove-value]').forEach(btn => {
-      btn.addEventListener('click', () => handleRemoveValue(td, btn.dataset.removeValue));
-    });
-  }
-
-  async function handleAddValue(td) {
-    const input = document.getElementById(`add-input-${td.id}`);
-    const value = input.value.trim();
-    if (!value) return;
-    if ((td.values || []).includes(value)) {
-      toast('That value already exists', 'warn');
-      return;
-    }
-    const updated = Object.assign({}, td, { values: [...(td.values || []), value] });
-    try {
-      const saved = await Api.saveTag(updated);
-      updateLocalTagDef(saved.tagDef || saved);
-      input.value = '';
-      render();
-      toast('Value added', 'success');
-    } catch (e) {
-      reportError(e, 'Failed to add value');
-    }
-  }
-
-  async function handleRemoveValue(td, value) {
-    const proceed = await confirmDependentDelete({
-      itemLabel: `"${value}"`,
-      checkUsage: () => Api.getTagUsage(td.id, value).then(r => r.count),
-      zeroUsageMessage: `Remove "${value}" from ${td.name}?`,
-    });
-    if (!proceed) return;
-
-    const updated = Object.assign({}, td, { values: (td.values || []).filter(v => v !== value) });
-    try {
-      const saved = await Api.saveTag(updated);
-      updateLocalTagDef(saved.tagDef || saved);
-      render();
-      toast('Value removed', 'success');
-    } catch (e) {
-      reportError(e, 'Failed to remove value');
-    }
   }
 
   async function handleDeleteTagDef(td) {
@@ -146,8 +94,6 @@ const Tags = (() => {
       toast('Tag deleted', 'success');
     } catch (e) {
       if (e.status === 409) {
-        // Race: something started using it between our check and the delete.
-        // Surface clearly and let the person retry, rather than silently failing.
         const retry = await confirmDialog(
           `"${td.name}" is now in use by ${e.data?.dependents ?? 'some'} record(s) (this changed since you opened this dialog). Delete anyway?`,
           { confirmLabel: 'Delete anyway' }
@@ -200,6 +146,7 @@ const Tags = (() => {
             </div>
             <span class="field-hint">A tag applying to multiple sections shares the same dropdown and value list across all of them.</span>
           </div>
+          ${!isEdit ? `<div class="field-hint mt-12">Add values for this tag afterward on the Manage Lists page.</div>` : ''}
         </form>
       </div>
       <div class="modal-footer">
@@ -210,7 +157,6 @@ const Tags = (() => {
     overlay.querySelectorAll('[data-act="close"]').forEach(b => b.addEventListener('click', () => closeModal(overlay)));
     overlay.querySelectorAll('.scope-pill').forEach(pill => {
       pill.addEventListener('click', (e) => {
-        // Let the native checkbox toggle happen, then sync the visual state.
         setTimeout(() => {
           const checked = pill.querySelector('input').checked;
           pill.classList.toggle('selected', checked);
@@ -231,7 +177,7 @@ const Tags = (() => {
       try {
         const saved = await Api.saveTag(payload);
         updateLocalTagDef(saved.tagDef || saved);
-        toast(isEdit ? 'Tag updated' : 'Tag created', 'success');
+        toast(isEdit ? 'Tag updated' : 'Tag created \u2014 add values on Manage Lists', 'success');
         closeModal(overlay);
         render();
       } catch (e) {

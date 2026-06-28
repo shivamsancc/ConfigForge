@@ -233,3 +233,57 @@ function rowMatchesSearch(row, query) {
 function renderSearchBox(id, placeholder) {
   return `<input type="text" id="${id}" class="search-box" placeholder="${escapeHtml(placeholder || 'Search\u2026')}" autocomplete="off">`;
 }
+
+// ---------------------------------------------------------------------------
+// Bandwidth string -> bits/sec, mirroring logic.py's _parse_bw_to_bps, so
+// sorting the Allocated BW column compares actual magnitude ("500 Mbps" <
+// "1 Gbps") instead of lexicographic string order.
+// ---------------------------------------------------------------------------
+function parseBwToBps(value) {
+  if (!value) return null;
+  const m = String(value).trim().match(/^([\d.]+)\s*([a-zA-Z]+)$/);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  const unit = m[2].toLowerCase();
+  const multipliers = { bps: 1, kbps: 1e3, mbps: 1e6, gbps: 1e9, kb: 1e3, mb: 1e6, gb: 1e9 };
+  const mult = multipliers[unit];
+  return mult === undefined ? null : num * mult;
+}
+
+// ---------------------------------------------------------------------------
+// Icon library -- small inline stroke-style SVGs (24x24 viewBox, currentColor
+// stroke) so every icon inherits whatever text color it's placed in and
+// needs no external icon font or image requests. Sized via CSS on .icon-svg.
+// ---------------------------------------------------------------------------
+const ICONS = {
+  dashboard: '<path d="M3 13h8V3H3zM13 21h8V11h-8zM13 3v6h8V3zM3 21h8v-6H3z"/>',
+  bandwidth: '<rect x="2.5" y="9" width="6" height="6" rx="1"/><rect x="15.5" y="9" width="6" height="6" rx="1"/><line x1="8.5" y1="12" x2="15.5" y2="12"/>',
+  router: '<rect x="2" y="9" width="20" height="7" rx="1.5"/><path d="M6 9V7a2 2 0 0 1 2-2M12 16v3M8 19h8"/><circle cx="7" cy="12.5" r=".6" fill="currentColor" stroke="none"/><circle cx="10" cy="12.5" r=".6" fill="currentColor" stroke="none"/>',
+  subnet: '<circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M12 7.4V12M12 12L6.6 17M12 12l5.4 5"/>',
+  tag: '<path d="M20.6 11.6 12.4 3.4A2 2 0 0 0 11 3H4a1 1 0 0 0-1 1v7a2 2 0 0 0 .6 1.4l8.2 8.2a2 2 0 0 0 2.8 0l6-6a2 2 0 0 0 0-2.8Z"/><circle cx="7.5" cy="7.5" r="1.3" fill="currentColor" stroke="none"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  generate: '<path d="M5 3l14 9-14 9V3z"/>',
+  history: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l4 2"/>',
+  audit: '<path d="M9 2h6l5 5v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h3z"/><path d="M9 2v5H4M9 13h6M9 17h6"/>',
+  import: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 19h16"/>',
+  export: '<path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 19h16"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  table: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/>',
+  grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+  sun: '<circle cx="12" cy="12" r="4.5"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
+  moon: '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z"/>',
+  warning: '<path d="M12 9v4M12 17h.01"/><path d="m10.3 3.9-8 14A1.5 1.5 0 0 0 3.6 20h16.8a1.5 1.5 0 0 0 1.3-2.3l-8-14a1.5 1.5 0 0 0-2.6 0Z"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
+  reset: '<path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 4v4h4"/>',
+  trash: '<path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+};
+
+function icon(name, { size = 16, className = '' } = {}) {
+  const body = ICONS[name];
+  if (!body) return '';
+  return `<svg class="icon-svg ${className}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+}

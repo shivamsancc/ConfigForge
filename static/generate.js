@@ -9,7 +9,7 @@ const Generate = (() => {
 
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16">
-        <button class="btn btn-primary" id="btn-generate">&#9656; Generate YAML</button>
+        <button class="btn btn-primary" id="btn-generate">${icon('generate', { size: 14 })} Generate YAML</button>
         ${result ? `<div class="text-dim">${escapeHtml(result.summary || '')}</div>` : ''}
       </div>
       <div id="generate-banners"></div>
@@ -47,7 +47,7 @@ const Generate = (() => {
       reportError(e, 'Generate failed');
     } finally {
       btn.disabled = false;
-      btn.textContent = '\u25b6 Generate YAML';
+      btn.innerHTML = `${icon('generate', { size: 14 })} Generate YAML`;
     }
   }
 
@@ -58,7 +58,7 @@ const Generate = (() => {
     if (result.missingCredsDevices && result.missingCredsDevices.length > 0) {
       parts.push(`
         <div class="banner banner-warn">
-          <span>&#9888;</span>
+          <span>${icon('warning', { size: 16 })}</span>
           <div class="banner-content">
             <b>${result.missingCredsDevices.length} device(s)</b> are missing SNMPv3 credentials and were still included.
             <button class="link" id="btn-view-missing-creds">View list</button>
@@ -69,7 +69,7 @@ const Generate = (() => {
     if (result.missingRegionDevices && result.missingRegionDevices.length > 0) {
       parts.push(`
         <div class="banner banner-danger">
-          <span>&#9888;</span>
+          <span>${icon('warning', { size: 16 })}</span>
           <div class="banner-content">
             <b>${result.missingRegionDevices.length} device(s)</b> have no Collector Region and were excluded from every output file.
             <button class="link" id="btn-view-missing-region">View list</button>
@@ -143,7 +143,7 @@ const Generate = (() => {
 
   function showMissingCredsModal(devices) {
     const overlay = openModal(`
-      <div class="modal-header"><h3>&#9888; Missing SNMPv3 Credentials</h3><button class="modal-close" data-act="close">&times;</button></div>
+      <div class="modal-header"><h3>${icon('warning', { size: 16 })} Missing SNMPv3 Credentials</h3><button class="modal-close" data-act="close">&times;</button></div>
       <div class="modal-body">
         <p class="text-dim mb-12">These devices were generated without complete SNMPv3 credentials. They were still included, but won't poll over SNMP until credentials are added.</p>
         <table>
@@ -158,7 +158,7 @@ const Generate = (() => {
 
   function showMissingRegionModal(devices) {
     const overlay = openModal(`
-      <div class="modal-header"><h3>&#9888; Devices Missing Collector Region</h3><button class="modal-close" data-act="close">&times;</button></div>
+      <div class="modal-header"><h3>${icon('warning', { size: 16 })} Devices Missing Collector Region</h3><button class="modal-close" data-act="close">&times;</button></div>
       <div class="modal-body">
         <p class="text-dim mb-12">These devices have no Collector Region set, so they were excluded from every generated YAML file.</p>
         <table>

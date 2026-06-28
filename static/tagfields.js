@@ -43,9 +43,8 @@ const TagFields = (() => {
   }
 
   // Render small read-only badges for a record's resolved tags (used in
-  // table/card views). Pass resolvedTags as {tagName: value} (already
-  // resolved server-side at generate time) OR rawTags as {tagId: value}
-  // plus the defs list to map id->name client-side for display purposes.
+  // card view, where compact badges read better than a wide grid of
+  // mostly-empty columns).
   function renderBadges(scope, rawTags) {
     const defs = defsForScope(scope);
     const entries = defs
@@ -53,6 +52,35 @@ const TagFields = (() => {
       .filter(([, v]) => !!v);
     if (entries.length === 0) return '';
     return entries.map(([name, value]) => `<span class="badge badge-violet">${escapeHtml(name)}: ${escapeHtml(value)}</span>`).join(' ');
+  }
+
+  // Table view shows one real column per tag def applicable to this
+  // scope (header = tag name, cell = value or an em-dash when unset),
+  // rather than packing everything into one combined "Tags" column.
+  // Pass a TableControls instance as `tc` to make these headers
+  // sortable too (sort key becomes "tag__<id>").
+  function renderTableHeaders(scope, tc) {
+    return defsForScope(scope).map(td => {
+      if (tc) return tc.sortableHeader(td.name, `tag__${td.id}`);
+      return `<th>${escapeHtml(td.name)}</th>`;
+    }).join('');
+  }
+
+  // Resolver map for TableControls.apply(), so sorting by a tag column
+  // reads the right nested value instead of trying row['tag__xyz'].
+  function tagSortResolvers(scope) {
+    const resolvers = {};
+    defsForScope(scope).forEach(td => {
+      resolvers[`tag__${td.id}`] = (row) => (row.tags || {})[td.id] || '';
+    });
+    return resolvers;
+  }
+
+  function renderTableCells(scope, rawTags) {
+    return defsForScope(scope).map(td => {
+      const v = (rawTags || {})[td.id];
+      return `<td>${v ? escapeHtml(v) : '<span class="text-faint">&mdash;</span>'}</td>`;
+    }).join('');
   }
 
   // During import, a spreadsheet may contain tag values that don't exist
@@ -93,5 +121,5 @@ const TagFields = (() => {
     }
   }
 
-  return { defsForScope, renderFormFields, readFormFields, renderBadges, registerNewValuesFromImport };
+  return { defsForScope, renderFormFields, readFormFields, renderBadges, renderTableHeaders, renderTableCells, tagSortResolvers, registerNewValuesFromImport };
 })();

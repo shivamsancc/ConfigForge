@@ -10,18 +10,19 @@ const Dashboard = (() => {
     const deviceMissingCreds = state.devices.filter(d => !Devices.isIcmpForced(d) && Devices.missingCreds(d)).length;
     const icmpDevices = state.devices.filter(d => Devices.isIcmpForced(d)).length;
     const snmpDevices = state.devices.length - icmpDevices;
+    const lastGen = state.meta.lastSavedAt;
 
     content.innerHTML = `
       <div class="stat-grid">
-        ${statCard('Devices', state.devices.length, `${snmpDevices} SNMP &middot; ${icmpDevices} ICMP-only`)}
-        ${statCard('Bandwidth Rows', state.bandwidth.length, `${countDistinctIps(state.bandwidth)} unique IP(s)`)}
-        ${statCard('Subnets', state.subnets.length, `${state.subnets.filter(s => Object.keys(s.tags || {}).length > 0).length} tagged`)}
-        ${statCard('Tags Defined', state.tagDefs.length, `${state.tagDefs.reduce((acc, t) => acc + (t.values || []).length, 0)} total values`)}
+        ${statCard('router', 'Devices', state.devices.length, `${snmpDevices} SNMP &middot; ${icmpDevices} ICMP-only`, 'devices')}
+        ${statCard('bandwidth', 'Bandwidth Rows', state.bandwidth.length, `${countDistinctIps(state.bandwidth)} unique IP(s)`, 'bandwidth')}
+        ${statCard('subnet', 'Subnets', state.subnets.length, `${state.subnets.filter(s => Object.keys(s.tags || {}).length > 0).length} tagged`, 'subnets')}
+        ${statCard('tag', 'Tags Defined', state.tagDefs.length, `${state.tagDefs.reduce((acc, t) => acc + (t.values || []).length, 0)} total values`, 'tags')}
       </div>
 
       ${(deviceMissingRegion > 0 || deviceMissingCreds > 0) ? `
-        <div class="banner banner-warn mb-16">
-          <span>&#9888;</span>
+        <div class="banner banner-warn mb-20">
+          <span>${icon('warning', { size: 16 })}</span>
           <div class="banner-content">
             ${deviceMissingRegion > 0 ? `<b>${deviceMissingRegion}</b> device(s) missing Collector Region. ` : ''}
             ${deviceMissingCreds > 0 ? `<b>${deviceMissingCreds}</b> device(s) missing SNMPv3 credentials. ` : ''}
@@ -30,16 +31,44 @@ const Dashboard = (() => {
         </div>
       ` : ''}
 
-      <div class="dash-section">
-        <div class="dash-section-title">Devices by Collector Region</div>
-        <div class="panel panel-body">${breakdownBars(groupCount(state.devices, 'Collector Region'))}</div>
-      </div>
+      <div class="dash-grid">
+        <div class="dash-col-main">
+          <div class="dash-card">
+            <div class="dash-card-header">
+              <h3>Devices by Collector Region</h3>
+            </div>
+            <div class="dash-card-body">${breakdownBars(groupCount(state.devices, 'Collector Region'))}</div>
+          </div>
 
-      ${state.tagDefs.length > 0 ? renderTagBreakdowns() : ''}
+          ${state.tagDefs.length > 0 ? renderTagBreakdowns() : `
+            <div class="dash-card">
+              <div class="dash-card-header"><h3>Custom Tag Breakdowns</h3></div>
+              <div class="dash-card-body">
+                <div class="text-faint" style="font-size:12.5px;">No tags defined yet. Create one in <button class="link" data-nav="tags">Manage Tags</button> to see breakdowns here.</div>
+              </div>
+            </div>
+          `}
+        </div>
 
-      <div class="dash-section">
-        <div class="dash-section-title">Recent Activity</div>
-        <div class="panel" id="dash-recent-audit"><div class="loading-row"><div class="spinner"></div> Loading&hellip;</div></div>
+        <div class="dash-col-side">
+          <div class="dash-card">
+            <div class="dash-card-header"><h3>Generation Status</h3></div>
+            <div class="dash-card-body">
+              ${lastGen ? `
+                <div class="status-row"><span class="text-dim">Last generated</span><span class="mono">${escapeHtml(lastGen)}</span></div>
+                <div class="status-row"><span class="text-dim">By</span><span>${escapeHtml(state.meta.lastSavedBy || 'unknown')}</span></div>
+              ` : `<div class="text-faint" style="font-size:12.5px;">No YAML generated yet.</div>`}
+              <button class="btn btn-primary w-full mt-12" data-nav="generate">${icon('generate', { size: 14 })} Go to Generate</button>
+            </div>
+          </div>
+
+          <div class="dash-card">
+            <div class="dash-card-header"><h3>Recent Activity</h3></div>
+            <div class="dash-card-body" id="dash-recent-audit" style="padding:0;">
+              <div class="loading-row"><div class="spinner"></div> Loading&hellip;</div>
+            </div>
+          </div>
+        </div>
       </div>
     `;
 
@@ -53,10 +82,13 @@ const Dashboard = (() => {
     }
   }
 
-  function statCard(label, value, sub) {
+  function statCard(iconName, label, value, sub, navTarget) {
     return `
-      <div class="stat-card">
-        <div class="stat-card-label">${escapeHtml(label)}</div>
+      <div class="stat-card" ${navTarget ? `data-nav="${navTarget}" style="cursor:pointer;"` : ''}>
+        <div class="stat-card-top">
+          <div class="stat-card-icon">${icon(iconName, { size: 18 })}</div>
+          <div class="stat-card-label">${escapeHtml(label)}</div>
+        </div>
         <div class="stat-card-value">${value}</div>
         <div class="stat-card-sub">${escapeHtml(sub)}</div>
       </div>
@@ -140,9 +172,9 @@ const Dashboard = (() => {
         }
         const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
         return `
-          <div class="dash-section">
-            <div class="dash-section-title">${escapeHtml(td.name)} &mdash; ${escapeHtml(scopeLabels[scope] || scope)}</div>
-            <div class="panel panel-body">${breakdownBars(entries)}</div>
+          <div class="dash-card">
+            <div class="dash-card-header"><h3>${escapeHtml(td.name)} &mdash; ${escapeHtml(scopeLabels[scope] || scope)}</h3></div>
+            <div class="dash-card-body">${breakdownBars(entries)}</div>
           </div>
         `;
       });
@@ -156,14 +188,17 @@ const Dashboard = (() => {
       el.innerHTML = `<div class="panel-body text-faint">No activity yet.</div>`;
       return;
     }
-    el.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th></tr></thead>
-      <tbody>
-        ${entries.map(e => `
-          <tr><td class="mono">${escapeHtml(e.ts)}</td><td>${escapeHtml(e.actor || 'unknown')}</td><td><span class="badge badge-neutral">${escapeHtml(e.action)}</span></td></tr>
-        `).join('')}
-      </tbody>
-    </table></div>`;
+    el.innerHTML = `<div class="activity-list">
+      ${entries.map(e => `
+        <div class="activity-row">
+          <span class="badge badge-neutral">${escapeHtml(e.action)}</span>
+          <div class="activity-meta">
+            <span>${escapeHtml(e.actor || 'unknown')}</span>
+            <span class="text-faint mono">${escapeHtml(e.ts)}</span>
+          </div>
+        </div>
+      `).join('')}
+    </div>`;
   }
 
   return { render };

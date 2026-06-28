@@ -12,6 +12,7 @@
 
 const Devices = (() => {
   let searchQuery = '';
+  const tc = TableControls.create('devices');
 
   function missingCreds(d) {
     return !d.snmpUser || !d.authProtocol || !d.authKey || !d.privProtocol || !d.privKey;
@@ -33,7 +34,7 @@ const Devices = (() => {
 
   function credBadge(d) {
     if (isIcmpForced(d)) return `<span class="badge badge-neutral">ICMP-only</span>`;
-    if (missingCreds(d)) return `<span class="badge badge-warn">SNMP &#9888;</span>`;
+    if (missingCreds(d)) return `<span class="badge badge-warn">SNMP ${icon('warning', { size: 12 })}</span>`;
     return `<span class="badge badge-ok">SNMP</span>`;
   }
 
@@ -53,16 +54,16 @@ const Devices = (() => {
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
         <div class="flex gap-8 wrap items-center">
-          <button class="btn btn-primary" id="btn-add-device">+ Add Device</button>
-          <button class="btn" id="btn-import-devices">Import from Excel</button>
-          <button class="btn" id="btn-export-devices">Export to Excel</button>
+          <button class="btn btn-primary" id="btn-add-device">${icon('plus', { size: 14 })} Add Device</button>
+          <button class="btn" id="btn-import-devices">${icon('import', { size: 14 })} Import from Excel</button>
+          <button class="btn" id="btn-export-devices">${icon('export', { size: 14 })} Export to Excel</button>
           ${renderSearchBox('device-search', 'Search devices\u2026')}
         </div>
         <div class="flex gap-12 items-center">
           <div class="text-dim" id="device-count-label">${state.devices.length} device(s)</div>
           <div class="view-toggle">
-            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
-            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
+            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">${icon('table', { size: 14 })} Table</button>
+            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">${icon('grid', { size: 14 })} Cards</button>
           </div>
         </div>
       </div>
@@ -78,8 +79,13 @@ const Devices = (() => {
     });
     const searchBox = document.getElementById('device-search');
     searchBox.value = searchQuery;
-    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; tc.resetPage(); renderBody(); });
   }
+
+  const SORT_RESOLVERS = {
+    'Collector Region': (d) => d['Collector Region'] || '',
+    status: (d) => isIcmpForced(d) ? 'icmp' : (missingCreds(d) ? 'warn' : 'ok'),
+  };
 
   function renderBody() {
     const body = document.getElementById('devices-body');
@@ -95,8 +101,20 @@ const Devices = (() => {
       body.innerHTML = emptyState({ title: 'No devices match your search', sub: `No results for "${searchQuery}".` });
       return;
     }
-    body.innerHTML = state.viewMode.devices === 'card' ? renderCards(devices) : `<div class="panel"><div class="table-wrap">${renderTable(devices)}</div></div>`;
+
+    if (state.viewMode.devices === 'card') {
+      const { pageRows, controlsHtml } = tc.apply(devices, { ...SORT_RESOLVERS, ...TagFields.tagSortResolvers('devices') });
+      body.innerHTML = `${renderCards(pageRows)}<div class="panel" style="margin-top:12px;">${controlsHtml}</div>`;
+      wireRowActions();
+      tc.wirePager(body, renderBody);
+      return;
+    }
+
+    const { pageRows, controlsHtml } = tc.apply(devices, { ...SORT_RESOLVERS, ...TagFields.tagSortResolvers('devices') });
+    body.innerHTML = `<div class="panel"><div class="table-wrap">${renderTable(pageRows)}</div>${controlsHtml}</div>`;
     wireRowActions();
+    tc.wireHeaders(body, renderBody);
+    tc.wirePager(body, renderBody);
   }
 
   function renderTable(devices) {
@@ -106,7 +124,7 @@ const Devices = (() => {
         <td>${escapeHtml(d.Device)}</td>
         <td>${regionBadge(d)}</td>
         <td>${escapeHtml(d['Config Type'])}</td>
-        <td>${TagFields.renderBadges('devices', d.tags) || '<span class="text-faint">&mdash;</span>'}</td>
+        ${TagFields.renderTableCells('devices', d.tags)}
         <td>${credBadge(d)}</td>
         <td>
           <button class="btn btn-sm" data-act="edit">Edit</button>
@@ -118,8 +136,9 @@ const Devices = (() => {
     return `
       <table>
         <thead><tr>
-          <th>IP</th><th>Device</th><th>Collector Region</th><th>Config Type</th>
-          <th>Tags</th><th>Status</th><th></th>
+          ${tc.sortableHeader('IP', 'IP')}${tc.sortableHeader('Device', 'Device')}${tc.sortableHeader('Collector Region', 'Collector Region')}${tc.sortableHeader('Config Type', 'Config Type')}
+          ${TagFields.renderTableHeaders('devices', tc)}
+          ${tc.sortableHeader('Status', 'status')}<th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -171,7 +190,7 @@ const Devices = (() => {
       await Api.deleteDevice(device.id);
       state.devices = state.devices.filter(d => d.id !== device.id);
       toast('Device deleted', 'success');
-      render();
+      if (state.currentView === 'devices') render();
       refreshCounts();
     } catch (e) {
       reportError(e, 'Delete failed');
@@ -345,7 +364,7 @@ const Devices = (() => {
         else state.devices.push(newDevice);
         toast(isEdit ? 'Device updated' : 'Device added', 'success');
         closeModal(overlay);
-        render();
+        if (state.currentView === 'devices') render();
         refreshCounts();
       } catch (e) {
         reportError(e, 'Save failed');
@@ -515,5 +534,5 @@ const Devices = (() => {
     });
   }
 
-  return { render, missingCreds, isIcmpForced };
+  return { render, missingCreds, isIcmpForced, _openFormExternal: openForm };
 })();

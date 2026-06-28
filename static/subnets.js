@@ -4,6 +4,7 @@
 
 const Subnets = (() => {
   let searchQuery = '';
+  const tc = TableControls.create('subnets');
 
   const FIELDS = [
     { key: 'CIDR', label: 'CIDR', required: true, placeholder: 'e.g. 10.1.1.0/24' },
@@ -27,21 +28,21 @@ const Subnets = (() => {
     content.innerHTML = `
       <div class="flex justify-between items-center mb-16 wrap gap-12">
         <div class="flex gap-8 wrap items-center">
-          <button class="btn btn-primary" id="btn-add-subnet">+ Add Subnet</button>
-          <button class="btn" id="btn-import-subnets">Import from Excel</button>
-          <button class="btn" id="btn-export-subnets">Export to Excel</button>
+          <button class="btn btn-primary" id="btn-add-subnet">${icon('plus', { size: 14 })} Add Subnet</button>
+          <button class="btn" id="btn-import-subnets">${icon('import', { size: 14 })} Import from Excel</button>
+          <button class="btn" id="btn-export-subnets">${icon('export', { size: 14 })} Export to Excel</button>
           ${renderSearchBox('subnet-search', 'Search subnets\u2026')}
         </div>
         <div class="flex gap-12 items-center">
           <div class="text-dim" id="subnet-count-label">${state.subnets.length} subnet(s)</div>
           <div class="view-toggle">
-            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">&#9776; Table</button>
-            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">&#9638; Cards</button>
+            <button class="${mode === 'table' ? 'active' : ''}" data-mode="table">${icon('table', { size: 14 })} Table</button>
+            <button class="${mode === 'card' ? 'active' : ''}" data-mode="card">${icon('grid', { size: 14 })} Cards</button>
           </div>
         </div>
       </div>
       <div class="banner banner-info mb-16">
-        <span>&#9432;</span>
+        <span>${icon('info', { size: 16 })}</span>
         <div class="banner-content">Devices inside a subnet's CIDR range automatically inherit that subnet's tags for any tag value they don't already set themselves.</div>
       </div>
       <div id="subnets-body"></div>
@@ -55,7 +56,7 @@ const Subnets = (() => {
     });
     const searchBox = document.getElementById('subnet-search');
     searchBox.value = searchQuery;
-    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; renderBody(); });
+    searchBox.addEventListener('input', (e) => { searchQuery = e.target.value; tc.resetPage(); renderBody(); });
   }
 
   function renderBody() {
@@ -72,8 +73,21 @@ const Subnets = (() => {
       body.innerHTML = emptyState({ title: 'No subnets match your search', sub: `No results for "${searchQuery}".` });
       return;
     }
-    body.innerHTML = state.viewMode.subnets === 'card' ? renderCards(subnets) : `<div class="panel"><div class="table-wrap">${renderTable(subnets)}</div></div>`;
+
+    const resolvers = TagFields.tagSortResolvers('subnets');
+    if (state.viewMode.subnets === 'card') {
+      const { pageRows, controlsHtml } = tc.apply(subnets, resolvers);
+      body.innerHTML = `${renderCards(pageRows)}<div class="panel" style="margin-top:12px;">${controlsHtml}</div>`;
+      wireRowActions();
+      tc.wirePager(body, renderBody);
+      return;
+    }
+
+    const { pageRows, controlsHtml } = tc.apply(subnets, resolvers);
+    body.innerHTML = `<div class="panel"><div class="table-wrap">${renderTable(pageRows)}</div>${controlsHtml}</div>`;
     wireRowActions();
+    tc.wireHeaders(body, renderBody);
+    tc.wirePager(body, renderBody);
   }
 
   function renderTable(subnets) {
@@ -81,7 +95,7 @@ const Subnets = (() => {
       <tr data-id="${escapeHtml(s.id)}">
         <td class="mono">${escapeHtml(s.CIDR)}</td>
         <td>${escapeHtml(s.Description)}</td>
-        <td>${TagFields.renderBadges('subnets', s.tags) || '<span class="text-faint">&mdash;</span>'}</td>
+        ${TagFields.renderTableCells('subnets', s.tags)}
         <td>
           <button class="btn btn-sm" data-act="edit">Edit</button>
           <button class="btn btn-sm btn-danger" data-act="delete">Delete</button>
@@ -90,10 +104,14 @@ const Subnets = (() => {
     `).join('');
     return `
       <table>
-        <thead><tr><th>CIDR</th><th>Description</th><th>Tags</th><th></th></tr></thead>
+        <thead><tr>
+          ${tc.sortableHeader('CIDR', 'CIDR')}${tc.sortableHeader('Description', 'Description')}
+          ${TagFields.renderTableHeaders('subnets', tc)}
+          <th></th>
+        </tr></thead>
         <tbody>${rows}</tbody>
       </table>
-    `;
+      `;
   }
 
   function renderCards(subnets) {
@@ -134,7 +152,7 @@ const Subnets = (() => {
       await Api.deleteSubnet(subnet.id);
       state.subnets = state.subnets.filter(s => s.id !== subnet.id);
       toast('Subnet deleted', 'success');
-      render();
+      if (state.currentView === 'subnets') render();
       refreshCounts();
     } catch (e) {
       reportError(e, 'Delete failed');
@@ -198,7 +216,7 @@ const Subnets = (() => {
         else state.subnets.push(newSubnet);
         toast(isEdit ? 'Subnet updated' : 'Subnet added', 'success');
         closeModal(overlay);
-        render();
+        if (state.currentView === 'subnets') render();
         refreshCounts();
       } catch (e) {
         reportError(e, 'Save failed');
@@ -315,5 +333,5 @@ const Subnets = (() => {
     });
   }
 
-  return { render };
+  return { render, _openFormExternal: openForm };
 })();

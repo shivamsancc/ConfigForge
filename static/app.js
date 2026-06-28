@@ -29,26 +29,28 @@ const state = {
 
 const VIEWS = [
   { group: 'Overview', items: [
-    { id: 'dashboard', label: 'Dashboard', icon: '&#9670;' },
+    { id: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
+    { id: 'tree', label: 'Network Tree', icon: 'subnet' },
   ] },
   { group: 'Inventory', items: [
-    { id: 'devices', label: 'Devices', icon: '&#9634;', countKey: 'deviceCount' },
-    { id: 'bandwidth', label: 'Bandwidth Capping', icon: '&#8645;', countKey: 'bandwidthCount' },
-    { id: 'subnets', label: 'Subnets', icon: '&#9737;', countKey: 'subnetCount' },
+    { id: 'devices', label: 'Devices', icon: 'router', countKey: 'deviceCount' },
+    { id: 'bandwidth', label: 'Bandwidth Capping', icon: 'bandwidth', countKey: 'bandwidthCount' },
+    { id: 'subnets', label: 'Subnets', icon: 'subnet', countKey: 'subnetCount' },
   ] },
   { group: 'Configuration', items: [
-    { id: 'tags', label: 'Manage Tags', icon: '&#9873;' },
-    { id: 'lists', label: 'Manage Lists', icon: '&#9776;' },
+    { id: 'tags', label: 'Manage Tags', icon: 'tag' },
+    { id: 'lists', label: 'Manage Lists', icon: 'list' },
   ] },
   { group: 'Output', items: [
-    { id: 'generate', label: 'Generate YAML', icon: '&#9656;' },
-    { id: 'history', label: 'YAML History', icon: '&#128340;' },
-    { id: 'audit', label: 'Audit Log', icon: '&#128221;' },
+    { id: 'generate', label: 'Generate YAML', icon: 'generate' },
+    { id: 'history', label: 'YAML History', icon: 'history' },
+    { id: 'audit', label: 'Audit Log', icon: 'audit' },
   ] },
 ];
 
 const VIEW_RENDERERS = {
   dashboard: () => Dashboard.render(),
+  tree: () => NetworkTree.render(),
   devices: () => Devices.render(),
   bandwidth: () => Bandwidth.render(),
   subnets: () => Subnets.render(),
@@ -61,6 +63,7 @@ const VIEW_RENDERERS = {
 
 const VIEW_TITLES = {
   dashboard: 'Dashboard',
+  tree: 'Network Tree',
   devices: 'Devices',
   bandwidth: 'Bandwidth Capping',
   subnets: 'Subnets',
@@ -75,13 +78,32 @@ function renderBrand() {
   document.getElementById('brand-mark').innerHTML = networkMotifSvg({ size: 26 });
 }
 
+function getCurrentTheme() {
+  return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+
+function setTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  try { localStorage.setItem('theme', theme); } catch (e) { /* ignore */ }
+  renderThemeToggle();
+}
+
+function renderThemeToggle() {
+  const btn = document.getElementById('btn-theme-toggle');
+  if (!btn) return;
+  const current = getCurrentTheme();
+  // Button shows the icon for the mode you'd switch TO.
+  btn.innerHTML = current === 'dark' ? icon('sun', { size: 16 }) : icon('moon', { size: 16 });
+  btn.title = current === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+}
+
 function renderSidebar() {
   const nav = document.getElementById('sidebar-nav');
   nav.innerHTML = VIEWS.map(group => `
     <div class="nav-group-label">${escapeHtml(group.group)}</div>
     ${group.items.map(item => `
       <div class="nav-item${state.currentView === item.id ? ' active' : ''}" data-view="${item.id}">
-        <span class="icon">${item.icon}</span>
+        <span class="icon">${icon(item.icon, { size: 16 })}</span>
         <span>${escapeHtml(item.label)}</span>
         ${item.countKey ? `<span class="count">${state.meta[item.countKey] ?? 0}</span>` : ''}
       </div>
@@ -136,6 +158,10 @@ async function boot() {
   renderBrand();
   renderSidebar();
   renderTopbar();
+  renderThemeToggle();
+  document.getElementById('btn-theme-toggle').addEventListener('click', () => {
+    setTheme(getCurrentTheme() === 'dark' ? 'light' : 'dark');
+  });
   try {
     await reloadAllData();
   } catch (e) {
