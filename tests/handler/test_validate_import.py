@@ -1,9 +1,10 @@
 """
 Integration tests for the validate-import endpoints.
 
-Each test spins up a real ThreadingHTTPServer on a random port backed by
-a temporary SQLite database, sends an HTTP request with http.client, and
-checks the response.  The server is torn down after each test class.
+Each test class creates an isolated FastAPI TestClient backed by a temporary
+SQLite database.  ``storage.init()`` is also called so that direct storage
+calls (``storage.list_devices()``, ``storage.upsert_device()``, etc.) share
+the same database as the HTTP layer.
 
 Endpoints exercised
 -------------------
@@ -25,45 +26,50 @@ Contracts verified
 10. Subnet findings include SUBNET_INVALID_CIDR for bad CIDRs.
 
 Run from the repository root:
-    python3 -m unittest tests/handler/test_validate_import.py
-    python3 -m unittest discover tests/handler/
+    python3 -m pytest tests/handler/test_validate_import.py -v
+    python3 -m unittest tests/handler/test_validate_import.py   (also works)
 """
-import http.client
-import json
 import os
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import ThreadingHTTPServer
+
+from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import core.storage as storage
-import core.handler as handler_module
+from app import create_app
 
 
 # ---------------------------------------------------------------------------
-# Test server fixture
+# Test client fixture
 # ---------------------------------------------------------------------------
 
-class _TestServer:
-    """Start a ConfigForge HTTP server on a random port for one test class."""
+class _TestClient:
+    """Create an isolated FastAPI TestClient for one test class."""
 
     def __init__(self):
         self._tmpdir = tempfile.TemporaryDirectory()
-        db_path = os.path.join(self._tmpdir.name, 'test.db')
-        storage.init(db_path)
+        self.db_path = os.path.join(self._tmpdir.name, 'test.db')
 
-        handler_module.STATIC_DIR = self._tmpdir.name  # unused but required
+        # Initialise the storage shim — used by tests that call storage.*
+        # functions directly to inspect or seed the database.
+        storage.init(self.db_path)
 
-        self._server = ThreadingHTTPServer(('127.0.0.1', 0), handler_module.Handler)
-        self.port = self._server.server_address[1]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        # Build the FastAPI app reusing the same ServiceContainer so HTTP
+        # requests and direct storage calls operate on the same data.
+        self.client = TestClient(
+            create_app(container=storage._container),
+            raise_server_exceptions=False,
+        )
+
+    def post(self, path: str, payload: dict):
+        """POST *payload* as JSON, return (status_code, response_dict)."""
+        r = self.client.post(path, json=payload)
+        return r.status_code, r.json()
 
     def stop(self):
-        self._server.shutdown()
         self._tmpdir.cleanup()
 
 
@@ -71,16 +77,9 @@ class _TestServer:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _post(port, path, payload):
-    """POST *payload* (dict) to *path* on 127.0.0.1:*port*.  Returns (status, data)."""
-    body = json.dumps(payload).encode('utf-8')
-    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
-    conn.request('POST', path, body, {'Content-Type': 'application/json'})
-    resp = conn.getresponse()
-    raw = resp.read()
-    conn.close()
-    data = json.loads(raw) if raw else {}
-    return resp.status, data
+def _post(tc: _TestClient, path: str, payload: dict):
+    """Module-level helper kept for symmetry with the original test layout."""
+    return tc.post(path, payload)
 
 
 def _clean_device(ip='192.0.2.1', name='Router1', region='us-east'):
@@ -111,15 +110,15 @@ def _clean_subnet(cidr='192.0.2.0/24', desc='Test Net'):
 class TestValidateImportDevices(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._srv = _TestServer()
-        cls.port = cls._srv.port
+        cls._srv = _TestClient()
+        cls.client = cls._srv.client
 
     @classmethod
     def tearDownClass(cls):
         cls._srv.stop()
 
     def _post(self, payload):
-        return _post(self.port, '/api/devices/validate-import', payload)
+        return self._srv.post('/api/devices/validate-import', payload)
 
     # --- HTTP contract ---
 
@@ -149,7 +148,6 @@ class TestValidateImportDevices(unittest.TestCase):
     # --- Finding schema contract ---
 
     def test_finding_has_required_keys(self):
-        # A device with an invalid IP will always produce at least one finding.
         _, data = self._post({'devices': [{'IP': 'not-an-ip', 'Device': 'X'}]})
         findings = data['findings']
         self.assertTrue(len(findings) > 0, 'expected at least one finding')
@@ -203,14 +201,12 @@ class TestValidateImportDevices(unittest.TestCase):
         self.assertIn('DEVICE_DUPLICATE_IP', codes)
 
     def test_findings_sorted_errors_before_warnings(self):
-        # Mix: one device missing IP (error), one missing creds (warning).
         d_no_ip = {'IP': '', 'Device': 'NoIp', 'Collector Region': 'us-east'}
         d_no_creds = _clean_device(ip='192.0.2.2', name='NoCreds')
         d_no_creds['snmpUser'] = ''
         _, data = self._post({'devices': [d_no_ip, d_no_creds]})
         findings = data['findings']
         severities = [f['severity'] for f in findings]
-        # All errors must appear before any warning.
         last_error_idx = max((i for i, s in enumerate(severities) if s == 'error'), default=-1)
         first_warn_idx = min((i for i, s in enumerate(severities) if s == 'warning'), default=len(severities))
         self.assertLessEqual(last_error_idx, first_warn_idx,
@@ -232,15 +228,15 @@ class TestValidateImportDevices(unittest.TestCase):
 class TestValidateImportBandwidth(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._srv = _TestServer()
-        cls.port = cls._srv.port
+        cls._srv = _TestClient()
+        cls.client = cls._srv.client
 
     @classmethod
     def tearDownClass(cls):
         cls._srv.stop()
 
     def _post(self, payload):
-        return _post(self.port, '/api/bandwidth/validate-import', payload)
+        return self._srv.post('/api/bandwidth/validate-import', payload)
 
     def test_returns_200_with_findings_key(self):
         status, data = self._post({'rows': [_clean_bw_row()]})
@@ -252,7 +248,6 @@ class TestValidateImportBandwidth(unittest.TestCase):
         self.assertIsInstance(data['findings'], list)
 
     def test_missing_key_returns_400(self):
-        # bandwidth uses 'rows', not 'bandwidth' or 'devices'.
         status, data = self._post({'devices': []})
         self.assertEqual(status, 400)
 
@@ -261,7 +256,6 @@ class TestValidateImportBandwidth(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_orphaned_bw_produces_finding_when_device_absent(self):
-        # Fresh server — no devices in DB → every BW row is orphaned.
         _, data = self._post({'rows': [_clean_bw_row(ip='192.0.2.50')]})
         codes = [f['code'] for f in data['findings']]
         self.assertIn('BW_ORPHANED', codes)
@@ -280,7 +274,6 @@ class TestValidateImportBandwidth(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_orphaned_bw_absent_when_device_exists(self):
-        # Write a device directly to DB, then validate a BW row for it.
         storage.upsert_device(_clean_device(ip='192.0.2.77', name='LiveDevice'))
         _, data = self._post({'rows': [_clean_bw_row(ip='192.0.2.77')]})
         codes = [f['code'] for f in data['findings']]
@@ -295,15 +288,15 @@ class TestValidateImportBandwidth(unittest.TestCase):
 class TestValidateImportSubnets(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._srv = _TestServer()
-        cls.port = cls._srv.port
+        cls._srv = _TestClient()
+        cls.client = cls._srv.client
 
     @classmethod
     def tearDownClass(cls):
         cls._srv.stop()
 
     def _post(self, payload):
-        return _post(self.port, '/api/subnets/validate-import', payload)
+        return self._srv.post('/api/subnets/validate-import', payload)
 
     def test_returns_200_with_findings_key(self):
         status, data = self._post({'subnets': [_clean_subnet()]})
@@ -329,7 +322,6 @@ class TestValidateImportSubnets(unittest.TestCase):
 
     def test_duplicate_cidr_produces_finding(self):
         s1 = _clean_subnet(cidr='10.0.0.0/8', desc='Net A')
-        # Host-bit set but same network after normalisation.
         s2 = {'CIDR': '10.1.2.3/8', 'Description': 'Net B'}
         _, data = self._post({'subnets': [s1, s2]})
         codes = [f['code'] for f in data['findings']]
@@ -340,7 +332,6 @@ class TestValidateImportSubnets(unittest.TestCase):
         _, data = self._post({'subnets': [bad]})
         findings = [f for f in data['findings'] if f['code'] == 'SUBNET_INVALID_CIDR']
         self.assertTrue(findings, 'expected SUBNET_INVALID_CIDR finding')
-        # The label from the Description field should appear in the message.
         self.assertIn('MySubnetLabel', findings[0]['message'])
 
     def test_validate_does_not_write_to_db(self):

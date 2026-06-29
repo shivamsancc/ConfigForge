@@ -52,15 +52,45 @@ schema, so their DELETE is unconditional.
 import json
 import os
 import re
-import ipaddress
 import traceback
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
-from core import storage, logic, validator, diff as differ
-from formats import yamldump, xlsxwriter
+from core.services.tag_service import TagInUseError
 
-STATIC_DIR = None  # set by server.py before serving
+STATIC_DIR = None   # set by server.py before serving
+_container = None   # set by set_container() before serving
+
+
+def set_container(container) -> None:
+    """Inject the service container.  Called once at startup by server.py."""
+    global _container
+    _container = container
+
+
+def _get_container():
+    """Return the active container, with a backward-compatible fallback.
+
+    New code calls ``set_container()`` explicitly at startup.  Legacy code
+    (including existing test helpers) calls ``storage.init()`` instead; in
+    that case the container is stored on the storage module and we retrieve
+    it here via a lazy import so there is no circular dependency at import
+    time.
+    """
+    if _container is not None:
+        return _container
+    # Backward-compat path: storage.init() stores the container on itself.
+    try:
+        from core import storage as _storage_mod  # lazy to avoid circular import
+        if _storage_mod._container is not None:
+            return _storage_mod._container
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "No service container is available. "
+        "Call handler.set_container(container) at startup, "
+        "or ensure storage.init() has been called."
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -110,58 +140,74 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
+        c = _get_container()
 
         try:
             if path == "/api/devices":
-                return self._send_json({"devices": storage.list_devices()})
+                return self._send_json({"devices": c.device_service.list_devices()})
             if path == "/api/bandwidth":
-                return self._send_json({"rows": storage.list_bandwidth()})
+                return self._send_json({"rows": c.bandwidth_service.list_bandwidth()})
             if path == "/api/subnets":
-                return self._send_json({"subnets": storage.list_subnets()})
+                return self._send_json({"subnets": c.subnet_service.list_subnets()})
             if path == "/api/lists":
-                return self._send_json({"lists": storage.get_lists()})
+                return self._send_json({"lists": c.list_service.get_lists()})
             if path == "/api/tags":
-                return self._send_json({"tagDefs": storage.list_tag_defs()})
+                return self._send_json({"tagDefs": c.tag_service.list_tags()})
 
             m = re.match(r"^/api/lists/([^/]+)/usage$", path)
             if m:
                 value = qs.get("value", [""])[0]
-                count = storage.list_usage_count(m.group(1), value)
+                count = c.list_service.usage_count(m.group(1), value)
                 return self._send_json({"count": count})
 
             m = re.match(r"^/api/tags/([^/]+)/usage$", path)
             if m:
                 value = qs.get("value", [None])[0]
                 if value is not None:
-                    count = storage.tag_value_usage_count(m.group(1), value)
+                    count = c.tag_service.value_usage_count(m.group(1), value)
                 else:
-                    count = storage.tag_def_usage_count(m.group(1))
+                    count = c.tag_service.usage_count(m.group(1))
                 return self._send_json({"count": count})
 
             if path == "/api/audit":
                 limit = int(qs.get("limit", ["100"])[0])
-                return self._send_json({"entries": storage.list_audit(limit)})
+                return self._send_json({"entries": c.audit_service.list_recent(limit)})
 
             if path == "/api/history":
                 limit = int(qs.get("limit", ["50"])[0])
-                return self._send_json({"entries": storage.list_history(limit)})
+                return self._send_json({"entries": c.history_service.list_recent(limit)})
 
             m = re.match(r"^/api/history/([^/]+)$", path)
             if m:
-                entry = storage.get_history_entry(m.group(1))
+                entry = c.history_service.get(m.group(1))
                 if not entry:
                     return self._send_json({"error": "not found"}, 404)
                 return self._send_json(entry)
 
             if path == "/api/meta":
-                return self._send_json(storage.get_meta())
+                return self._send_json(c.meta_service.get_meta())
 
             if path == "/api/export/devices.xlsx":
-                return self._export_devices_xlsx()
+                data = c.export_service.build_devices_xlsx()
+                return self._send_binary(
+                    data,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "devices_export.xlsx",
+                )
             if path == "/api/export/bandwidth.xlsx":
-                return self._export_bandwidth_xlsx()
+                data = c.export_service.build_bandwidth_xlsx()
+                return self._send_binary(
+                    data,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "bandwidth_export.xlsx",
+                )
             if path == "/api/export/subnets.xlsx":
-                return self._export_subnets_xlsx()
+                data = c.export_service.build_subnets_xlsx()
+                return self._send_binary(
+                    data,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "subnets_export.xlsx",
+                )
 
             return self._serve_static(path)
         except Exception as e:
@@ -208,229 +254,122 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send_json({"error": f"invalid JSON body: {e}"}, 400)
         actor = body.get("_actor")
+        c = _get_container()
 
         try:
             if path == "/api/devices":
-                return self._upsert_device(body, actor)
+                return self._upsert_device(body, actor, c)
             if path == "/api/devices/import":
-                return self._import_rows(body, actor, scope="devices")
+                return self._import_rows(body, actor, scope="devices", c=c)
             if path == "/api/devices/validate-import":
-                return self._validate_import_rows(body, scope="devices")
+                return self._validate_import_rows(body, scope="devices", c=c)
 
             if path == "/api/bandwidth":
-                return self._upsert_bandwidth(body, actor)
+                return self._upsert_bandwidth(body, actor, c)
             if path == "/api/bandwidth/import":
-                return self._import_rows(body, actor, scope="bandwidth")
+                return self._import_rows(body, actor, scope="bandwidth", c=c)
             if path == "/api/bandwidth/validate-import":
-                return self._validate_import_rows(body, scope="bandwidth")
+                return self._validate_import_rows(body, scope="bandwidth", c=c)
 
             if path == "/api/subnets":
-                return self._upsert_subnet(body, actor)
+                return self._upsert_subnet(body, actor, c)
             if path == "/api/subnets/import":
-                return self._import_rows(body, actor, scope="subnets")
+                return self._import_rows(body, actor, scope="subnets", c=c)
             if path == "/api/subnets/validate-import":
-                return self._validate_import_rows(body, scope="subnets")
+                return self._validate_import_rows(body, scope="subnets", c=c)
 
             m = re.match(r"^/api/lists/([^/]+)$", path)
             if m:
-                return self._set_list(m.group(1), body, actor)
+                return self._set_list(m.group(1), body, actor, c)
 
             if path == "/api/tags":
-                return self._upsert_tag(body, actor)
+                return self._upsert_tag(body, actor, c)
 
             if path == "/api/generate":
-                return self._generate(actor)
+                return self._generate(actor, c)
 
             return self._send_json({"error": "not found"}, 404)
         except ValueError as e:
             return self._send_json({"error": str(e)}, 400)
         except Exception as e:
-            traceback.print_exc()  # full traceback to the server console
+            traceback.print_exc()
             return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
 
-    def _upsert_device(self, body, actor):
+    def _upsert_device(self, body, actor, c):
         device = body.get("device")
         if not isinstance(device, dict):
             return self._send_json({"error": "'device' must be an object"}, 400)
-        ip = (device.get("IP") or "").strip()
-        if ip and not logic.is_valid_ip(ip):
-            return self._send_json({"error": f"'{ip}' is not a valid IP address"}, 400)
-        is_create = not device.get("id")
-        saved = storage.upsert_device(device)
-        storage.log_audit(actor, "create_device" if is_create else "update_device",
-                           {"id": saved["id"], "ip": saved.get("IP")})
+        saved = c.device_service.create_or_update(device, actor)
         return self._send_json({"device": saved})
 
-    def _upsert_bandwidth(self, body, actor):
+    def _upsert_bandwidth(self, body, actor, c):
         row = body.get("row")
         if not isinstance(row, dict):
             return self._send_json({"error": "'row' must be an object"}, 400)
-        ip = (row.get("IP") or "").strip()
-        if ip and not logic.is_valid_ip(ip):
-            return self._send_json({"error": f"'{ip}' is not a valid IP address"}, 400)
-        is_create = not row.get("id")
-        saved = storage.upsert_bandwidth(row)
-        storage.log_audit(actor, "create_bandwidth" if is_create else "update_bandwidth",
-                           {"id": saved["id"], "ip": saved.get("IP")})
+        saved = c.bandwidth_service.create_or_update(row, actor)
         return self._send_json({"row": saved})
 
-    def _upsert_subnet(self, body, actor):
+    def _upsert_subnet(self, body, actor, c):
         subnet = body.get("subnet")
         if not isinstance(subnet, dict):
             return self._send_json({"error": "'subnet' must be an object"}, 400)
-        cidr = (subnet.get("CIDR") or "").strip()
-        if cidr:
-            try:
-                ipaddress.ip_network(cidr, strict=False)
-            except ValueError:
-                return self._send_json({"error": f"'{cidr}' is not a valid CIDR"}, 400)
-        is_create = not subnet.get("id")
-        saved = storage.upsert_subnet(subnet)
-        storage.log_audit(actor, "create_subnet" if is_create else "update_subnet",
-                           {"id": saved["id"], "cidr": saved.get("CIDR")})
+        saved = c.subnet_service.create_or_update(subnet, actor)
         return self._send_json({"subnet": saved})
 
-    def _import_rows(self, body, actor, scope):
+    def _import_rows(self, body, actor, scope, c):
         key = {"devices": "devices", "bandwidth": "rows", "subnets": "subnets"}[scope]
         rows = body.get(key)
         if not isinstance(rows, list):
             return self._send_json({"error": f"'{key}' must be a list"}, 400)
         mode = body.get("mode", "merge")
-        if mode not in ("merge", "replace"):
-            return self._send_json({"error": "'mode' must be 'merge' or 'replace'"}, 400)
-
-        replace_fn, merge_fn = {
-            "devices": (storage.replace_all_devices, storage.merge_devices),
-            "bandwidth": (storage.replace_all_bandwidth, storage.merge_bandwidth),
-            "subnets": (storage.replace_all_subnets, storage.merge_subnets),
-        }[scope]
-
-        if mode == "replace":
-            replace_fn(rows)
-        else:
-            merge_fn(rows)
-
-        storage.log_audit(actor, f"import_{scope}", {"count": len(rows), "mode": mode})
-        return self._send_json({"imported": len(rows), "mode": mode})
-
-    def _validate_import_rows(self, body, scope):
-        """Run validation and diff against a proposed import payload.
-
-        Reads the same payload format as the corresponding import endpoint
-        but never writes to the database.  Returns::
-
-            {
-                "findings": [...],   # same schema as the generate endpoint
-                "diff":     {        # change preview (see core/diff.py)
-                    "new":       [...],
-                    "modified":  [...],
-                    "unchanged": int,
-                    "removed":   [...]
-                }
-            }
-
-        Both the validation engine and the diff engine share the same
-        already-loaded inventory lists so only one round of DB reads occurs.
-
-        Scope semantics — validation
-        ----------------------------
-        devices   — validate only the imported device rows against each other.
-                    Existing bandwidth and subnets are excluded so orphan checks
-                    do not produce noise about data outside this import.
-        bandwidth — validate imported bandwidth rows cross-referenced against
-                    the live device inventory so BW_ORPHANED findings are
-                    meaningful.
-        subnets   — validate only the imported subnet rows against each other.
-
-        Scope semantics — diff
-        ----------------------
-        All scopes compare incoming rows against the full current inventory for
-        that scope.  The ``mode`` field from the request body is used to decide
-        whether to include ``removed`` records (replace mode only).
-        """
-        key = {"devices": "devices", "bandwidth": "rows", "subnets": "subnets"}[scope]
-        rows = body.get(key)
-        if not isinstance(rows, list):
-            return self._send_json({"error": f"'{key}' must be a list"}, 400)
-
-        mode = body.get("mode", "merge")
-        tag_defs = storage.list_tag_defs()
-
-        # Load existing inventory once; reuse for both validation and diff.
-        existing_devices  = storage.list_devices()
-        existing_bandwidth = storage.list_bandwidth()
-        existing_subnets  = storage.list_subnets()
 
         if scope == "devices":
-            findings = validator.validate_inventory(rows, [], [], tag_defs)
-            diff_result = differ.diff_import("devices", rows, existing_devices, mode, tag_defs)
+            result = c.import_service.import_devices(rows, mode, actor)
         elif scope == "bandwidth":
-            findings = validator.validate_inventory(existing_devices, rows, [], tag_defs)
-            diff_result = differ.diff_import("bandwidth", rows, existing_bandwidth, mode, tag_defs)
+            result = c.import_service.import_bandwidth(rows, mode, actor)
+        else:
+            result = c.import_service.import_subnets(rows, mode, actor)
+
+        return self._send_json(result)
+
+    def _validate_import_rows(self, body, scope, c):
+        key = {"devices": "devices", "bandwidth": "rows", "subnets": "subnets"}[scope]
+        rows = body.get(key)
+        if not isinstance(rows, list):
+            return self._send_json({"error": f"'{key}' must be a list"}, 400)
+        mode = body.get("mode", "merge")
+
+        if scope == "devices":
+            result = c.import_service.validate_import_devices(rows, mode)
+        elif scope == "bandwidth":
+            result = c.import_service.validate_import_bandwidth(rows, mode)
         elif scope == "subnets":
-            findings = validator.validate_inventory([], [], rows, tag_defs)
-            diff_result = differ.diff_import("subnets", rows, existing_subnets, mode, tag_defs)
+            result = c.import_service.validate_import_subnets(rows, mode)
         else:
             return self._send_json({"error": "unknown scope"}, 400)
 
-        return self._send_json({"findings": findings, "diff": diff_result})
+        return self._send_json(result)
 
-    def _set_list(self, list_name, body, actor):
-        if list_name not in storage.FIXED_LISTS:
-            return self._send_json({"error": f"unknown list '{list_name}'"}, 404)
+    def _set_list(self, list_name, body, actor, c):
         items = body.get("items")
         if not isinstance(items, list):
             return self._send_json({"error": "'items' must be a list"}, 400)
-        storage.set_list(list_name, items)
-        storage.log_audit(body.get("_actor"), "update_list", {"list": list_name, "items": items})
-        return self._send_json({"items": items})
+        try:
+            saved = c.list_service.set_list(list_name, items, actor)
+        except ValueError as e:
+            return self._send_json({"error": str(e)}, 404)
+        return self._send_json({"items": saved})
 
-    def _upsert_tag(self, body, actor):
+    def _upsert_tag(self, body, actor, c):
         tag_def = body.get("tagDef")
         if not isinstance(tag_def, dict):
             return self._send_json({"error": "'tagDef' must be an object"}, 400)
-        if not tag_def.get("name", "").strip():
-            return self._send_json({"error": "tag name is required"}, 400)
-        invalid_scopes = [s for s in tag_def.get("scopes", []) if s not in storage.TAG_SCOPES]
-        if invalid_scopes:
-            return self._send_json({"error": f"invalid scope(s): {invalid_scopes}"}, 400)
-        is_create = not tag_def.get("id")
-        saved = storage.upsert_tag_def(tag_def)
-        storage.log_audit(actor, "create_tag" if is_create else "update_tag",
-                           {"id": saved["id"], "name": saved.get("name")})
+        saved = c.tag_service.create_or_update(tag_def, actor)
         return self._send_json({"tagDef": saved})
 
-    def _generate(self, actor):
-        devices = storage.list_devices()
-        bandwidth = storage.list_bandwidth()
-        subnets = storage.list_subnets()
-        tag_defs = storage.list_tag_defs()
-
-        result = logic.convert_to_collector_configs(devices, bandwidth, subnets, tag_defs)
-
-        rendered_files = {name: yamldump.dump(config) for name, config in result["files"].items()}
-        result["files"] = rendered_files
-
-        # Run validation on the same in-memory data — no additional SQLite reads.
-        result["findings"] = validator.validate_inventory(
-            devices, bandwidth, subnets, tag_defs
-        )
-
-        storage.save_history(actor, result["summary"], rendered_files)
-        storage.log_audit(actor, "generate", {"summary": result["summary"]})
+    def _generate(self, actor, c):
+        result = c.generate_service.generate(actor)
         return self._send_json(result)
-
-    def _export_devices_xlsx(self):
-        data = build_devices_xlsx(storage.list_devices(), storage.list_tag_defs())
-        self._send_binary(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "devices_export.xlsx")
-
-    def _export_bandwidth_xlsx(self):
-        data = build_bandwidth_xlsx(storage.list_bandwidth(), storage.list_tag_defs())
-        self._send_binary(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "bandwidth_export.xlsx")
-
-    def _export_subnets_xlsx(self):
-        data = build_subnets_xlsx(storage.list_subnets(), storage.list_tag_defs())
-        self._send_binary(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "subnets_export.xlsx")
 
     # -------------------------------------------------------------------
     # DELETE
@@ -440,99 +379,37 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
         actor = qs.get("_actor", [None])[0]
+        c = _get_container()
 
         try:
             m = re.match(r"^/api/devices/([^/]+)$", path)
             if m:
-                storage.delete_device(m.group(1))
-                storage.log_audit(actor, "delete_device", {"id": m.group(1)})
+                c.device_service.delete(m.group(1), actor)
                 return self._send_json({"deleted": m.group(1)})
 
             m = re.match(r"^/api/bandwidth/([^/]+)$", path)
             if m:
-                storage.delete_bandwidth(m.group(1))
-                storage.log_audit(actor, "delete_bandwidth", {"id": m.group(1)})
+                c.bandwidth_service.delete(m.group(1), actor)
                 return self._send_json({"deleted": m.group(1)})
 
             m = re.match(r"^/api/subnets/([^/]+)$", path)
             if m:
-                storage.delete_subnet(m.group(1))
-                storage.log_audit(actor, "delete_subnet", {"id": m.group(1)})
+                c.subnet_service.delete(m.group(1), actor)
                 return self._send_json({"deleted": m.group(1)})
 
             m = re.match(r"^/api/tags/([^/]+)$", path)
             if m:
                 tag_id = m.group(1)
                 force = qs.get("force", ["false"])[0] == "true"
-                dependents = storage.tag_def_usage_count(tag_id)
-                if dependents > 0 and not force:
+                try:
+                    result = c.tag_service.delete(tag_id, actor, force=force)
+                    return self._send_json({"deleted": result["deleted"]})
+                except TagInUseError as e:
                     return self._send_json(
-                        {"error": "tag is in use", "dependents": dependents}, 409
+                        {"error": "tag is in use", "dependents": e.dependents}, 409
                     )
-                storage.delete_tag_def(tag_id)
-                storage.log_audit(actor, "delete_tag", {"id": tag_id, "dependents_forced": dependents if force else 0})
-                return self._send_json({"deleted": tag_id})
 
             return self._send_json({"error": "not found"}, 404)
         except Exception as e:
             traceback.print_exc()
             return self._send_json({"error": str(e), "type": type(e).__name__}, 500)
-
-
-# ---------------------------------------------------------------------------
-# Excel export (template-compatible with the import flow)
-# ---------------------------------------------------------------------------
-def build_devices_xlsx(devices: list, tag_defs: list) -> bytes:
-    # Only IP, Device, Collector Region (mandatory, hardcoded), Config
-    # Type, Remarks, and credentials remain bare device fields. Every
-    # other categorization (Device Class, Region, Center, etc.) is now
-    # tag-driven and only appears as a column if/when someone actually
-    # creates that tag through the Tags module -- see migrations.py
-    # migrate_3 for how pre-existing values get promoted into tags.
-    fixed_cols = ["IP", "Device", "Collector Region", "Config Type", "Remarks",
-                  "snmpUser", "authProtocol", "authKey", "privProtocol", "privKey"]
-    device_tag_defs = [td for td in tag_defs if "devices" in td.get("scopes", [])]
-    tag_cols = [td["name"] for td in device_tag_defs]
-    headers = fixed_cols + tag_cols
-
-    rows = []
-    for d in devices:
-        row = [d.get(c, "") for c in fixed_cols]
-        for td in device_tag_defs:
-            row.append((d.get("tags") or {}).get(td["id"], ""))
-        rows.append(row)
-
-    return xlsxwriter.write_xlsx("devices", headers, rows)
-
-
-def build_bandwidth_xlsx(rows_in: list, tag_defs: list) -> bytes:
-    fixed_cols = ["IP", "Interface", "Allocated BW", "Region", "Center", "Link Type",
-                  "Interface_description"]
-    bw_tag_defs = [td for td in tag_defs if "bandwidth" in td.get("scopes", [])]
-    tag_cols = [td["name"] for td in bw_tag_defs]
-    headers = fixed_cols + tag_cols
-
-    rows = []
-    for r in rows_in:
-        row = [r.get(c, "") for c in fixed_cols]
-        for td in bw_tag_defs:
-            row.append((r.get("tags") or {}).get(td["id"], ""))
-        rows.append(row)
-
-    return xlsxwriter.write_xlsx("bandwidth_capping", headers, rows)
-
-
-def build_subnets_xlsx(subnets_in: list, tag_defs: list) -> bytes:
-    fixed_cols = ["CIDR", "Description"]
-    subnet_tag_defs = [td for td in tag_defs if "subnets" in td.get("scopes", [])]
-    tag_cols = [td["name"] for td in subnet_tag_defs]
-    headers = fixed_cols + tag_cols
-
-    rows = []
-    for s in subnets_in:
-        row = [s.get(c, "") for c in fixed_cols]
-        for td in subnet_tag_defs:
-            row.append((s.get("tags") or {}).get(td["id"], ""))
-        rows.append(row)
-
-    return xlsxwriter.write_xlsx("subnets", headers, rows)

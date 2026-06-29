@@ -1,485 +1,235 @@
 """
-Storage layer: SQLite (WAL mode), thread-safe via a global lock.
+Storage façade — backward-compatible shim over the Repository layer.
 
-Tables (created/evolved by migrations.py, never directly here):
-  devices         - one row per device, JSON blob + indexed id
-  bandwidth_caps  - one row per bandwidth cap entry
-  subnets         - one row per subnet (CIDR-based)
-  lists           - the one fixed managed dropdown: Collector Region.
-                    Every other categorization (Device Class, Region,
-                    custom fields, etc.) lives in tag_defs instead --
-                    Collector Region is the sole exception because it's
-                    mandatory and drives YAML generation directly.
-  tag_defs        - dynamic tag list definitions, each with a name, the
-                    scopes (devices/bandwidth/subnets) it applies to, and
-                    its set of allowed values
-  audit_log       - append-only action log
-  yaml_history    - past generations
-  meta            - small key/value store (lastSavedAt, lastSavedBy, schema_version)
+This module preserves the original public API (``init()``, ``list_devices()``,
+``upsert_device()``, etc.) so that existing code and tests that import
+``core.storage`` continue to work without modification.
 
-SNMPv3 authKey/privKey are AES-256-GCM encrypted at rest (aesgcm.py).
+Internally every function now delegates to the matching repository or service
+held in the module-level ``_container`` singleton, which is created by
+``init()``.  No SQLite calls remain in this file; all persistence logic
+lives in ``core/repositories/sqlite/``.
+
+Architecture note
+-----------------
+New code should import and use services (``core.services.*``) or, where
+only data retrieval is needed, repository interfaces (``core.repositories.*``).
+This shim exists purely to avoid a big-bang migration of callers that were
+written before the Repository Pattern was introduced.
 """
-import base64
-import json
-import sqlite3
-import threading
-import time
-import uuid
 import ipaddress
+import time
 
-from core import aesgcm
-from core import migrations
+from core.container import ServiceContainer
+from core.repositories.sqlite.list import FIXED_LISTS
+from core.services.tag_service import TAG_SCOPES
 
-_lock = threading.Lock()
-_conn: sqlite3.Connection = None
+# Re-export constants so ``storage.FIXED_LISTS`` and ``storage.TAG_SCOPES``
+# continue to resolve correctly for any caller that references them.
+FIXED_LISTS = FIXED_LISTS  # noqa: F811 — intentional re-assignment for re-export
+TAG_SCOPES = TAG_SCOPES      # noqa: F811
 
-_CRED_FIELDS = ("authKey", "privKey")
-
-# Fixed key embedded here on purpose (see README: protects the raw .db
-# file at rest, not the running app itself — known, accepted tradeoff).
-_ENC_KEY = b"ConfigForge-static-at-rest-key!!"  # exactly 32 bytes
-assert len(_ENC_KEY) == 32
-
-# Collector Region is the only field that remains a hardcoded, mandatory
-# concept -- it's what generation groups devices by, so the system can't
-# function without it. Every other categorization is created on demand
-# through the Tags module (see migrations.py migrate_3 for how
-# Device Class / Device Category / Device Type / Operating Region /
-# geolocation / Region / Center get migrated into tags for upgraders).
-FIXED_LISTS = ("collectorRegions",)
-TAG_SCOPES = ("devices", "bandwidth", "subnets")
+_container: ServiceContainer | None = None
 
 
-def init(db_path: str):
-    global _conn
-    _conn = sqlite3.connect(db_path, check_same_thread=False)
-    _conn.row_factory = sqlite3.Row
-    _conn.execute("PRAGMA journal_mode=WAL")
-    with _lock:
-        migrations.run_pending_migrations(_conn)
-        for name in FIXED_LISTS:
-            _conn.execute(
-                "INSERT OR IGNORE INTO lists (list_name, items) VALUES (?, ?)",
-                (name, json.dumps([])),
-            )
-        _conn.commit()
+# ---------------------------------------------------------------------------
+# Initialisation
+# ---------------------------------------------------------------------------
+
+def init(db_path: str) -> None:
+    """Open (or create) the SQLite database and run pending migrations."""
+    global _container
+    _container = ServiceContainer(db_path)
 
 
-def now_iso():
+def _c() -> ServiceContainer:
+    if _container is None:
+        raise RuntimeError("storage.init() has not been called")
+    return _container
+
+
+# ---------------------------------------------------------------------------
+# Time helpers (kept for any caller that imports them directly)
+# ---------------------------------------------------------------------------
+
+def now_iso() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-# ---------------------------------------------------------------------------
-# Credential encryption
-# ---------------------------------------------------------------------------
-def _encrypt_field(value: str) -> str:
-    blob = aesgcm.encrypt(_ENC_KEY, value.encode("utf-8"))
-    return base64.b64encode(blob).decode("ascii")
-
-
-def _decrypt_field(value: str) -> str:
-    try:
-        blob = base64.b64decode(value)
-        return aesgcm.decrypt(_ENC_KEY, blob).decode("utf-8")
-    except Exception:
-        # Tolerate legacy/plaintext rows rather than hard-crash the read path.
-        return value
-
-
-def _encode_device(device: dict) -> dict:
-    out = dict(device)
-    for field in _CRED_FIELDS:
-        if out.get(field):
-            out[field] = _encrypt_field(out[field])
-    return out
-
-
-def _decode_device(device: dict) -> dict:
-    out = dict(device)
-    for field in _CRED_FIELDS:
-        if out.get(field):
-            out[field] = _decrypt_field(out[field])
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Generic row CRUD (shared shape for devices / bandwidth_caps / subnets)
-# ---------------------------------------------------------------------------
-def _list_rows(table, decode=None):
-    with _lock:
-        rows = _conn.execute(f"SELECT data FROM {table} ORDER BY updated_at ASC").fetchall()
-    out = [json.loads(r["data"]) for r in rows]
-    return [decode(r) for r in out] if decode else out
-
-
-def _get_row(table, row_id, decode=None):
-    with _lock:
-        row = _conn.execute(f"SELECT data FROM {table} WHERE id = ?", (row_id,)).fetchone()
-    if not row:
-        return None
-    data = json.loads(row["data"])
-    return decode(data) if decode else data
-
-
-def _upsert_row(table, row: dict, encode=None):
-    if not row.get("id"):
-        row["id"] = str(uuid.uuid4())
-    row.setdefault("tags", {})
-    encoded = encode(row) if encode else row
-    with _lock:
-        _conn.execute(
-            f"INSERT INTO {table} (id, data, updated_at) VALUES (?, ?, ?) "
-            f"ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-            (row["id"], json.dumps(encoded), time.time()),
-        )
-        _conn.commit()
-    return row
-
-
-def _delete_row(table, row_id):
-    with _lock:
-        _conn.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
-        _conn.commit()
-
-
-def _replace_all(table, rows: list, encode=None):
-    with _lock:
-        _conn.execute(f"DELETE FROM {table}")
-        now = time.time()
-        for r in rows:
-            if not r.get("id"):
-                r["id"] = str(uuid.uuid4())
-            r.setdefault("tags", {})
-            encoded = encode(r) if encode else r
-            _conn.execute(
-                f"INSERT INTO {table} (id, data, updated_at) VALUES (?, ?, ?)",
-                (r["id"], json.dumps(encoded), now),
-            )
-        _conn.commit()
-
-
-def _merge_rows(table, rows: list, encode=None):
-    for r in rows:
-        _upsert_row(table, r, encode=encode)
+def now_iso_from_unix(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 # ---------------------------------------------------------------------------
 # Devices
 # ---------------------------------------------------------------------------
-def list_devices():
-    return _list_rows("devices", decode=_decode_device)
+
+def list_devices() -> list:
+    return _c().device_repo.list_all()
 
 
-def get_device(device_id):
-    return _get_row("devices", device_id, decode=_decode_device)
+def get_device(device_id: str):
+    return _c().device_repo.get(device_id)
 
 
-def upsert_device(device: dict):
-    return _upsert_row("devices", device, encode=_encode_device)
+def upsert_device(device: dict) -> dict:
+    return _c().device_repo.upsert(device)
 
 
-def delete_device(device_id):
-    _delete_row("devices", device_id)
+def delete_device(device_id: str) -> None:
+    _c().device_repo.delete(device_id)
 
 
-def replace_all_devices(devices: list):
-    _replace_all("devices", devices, encode=_encode_device)
+def replace_all_devices(devices: list) -> None:
+    _c().device_repo.replace_all(devices)
 
 
-def merge_devices(devices: list):
-    _merge_rows("devices", devices, encode=_encode_device)
+def merge_devices(devices: list) -> None:
+    _c().device_repo.merge(devices)
 
 
 # ---------------------------------------------------------------------------
 # Bandwidth caps
 # ---------------------------------------------------------------------------
-def list_bandwidth():
-    return _list_rows("bandwidth_caps")
+
+def list_bandwidth() -> list:
+    return _c().bandwidth_repo.list_all()
 
 
-def get_bandwidth(row_id):
-    return _get_row("bandwidth_caps", row_id)
+def get_bandwidth(row_id: str):
+    return _c().bandwidth_repo.get(row_id)
 
 
-def upsert_bandwidth(row: dict):
-    return _upsert_row("bandwidth_caps", row)
+def upsert_bandwidth(row: dict) -> dict:
+    return _c().bandwidth_repo.upsert(row)
 
 
-def delete_bandwidth(row_id):
-    _delete_row("bandwidth_caps", row_id)
+def delete_bandwidth(row_id: str) -> None:
+    _c().bandwidth_repo.delete(row_id)
 
 
-def replace_all_bandwidth(rows: list):
-    _replace_all("bandwidth_caps", rows)
+def replace_all_bandwidth(rows: list) -> None:
+    _c().bandwidth_repo.replace_all(rows)
 
 
-def merge_bandwidth(rows: list):
-    _merge_rows("bandwidth_caps", rows)
+def merge_bandwidth(rows: list) -> None:
+    _c().bandwidth_repo.merge(rows)
 
 
 # ---------------------------------------------------------------------------
 # Subnets
 # ---------------------------------------------------------------------------
-def list_subnets():
-    return _list_rows("subnets")
+
+def list_subnets() -> list:
+    return _c().subnet_repo.list_all()
 
 
-def get_subnet(row_id):
-    return _get_row("subnets", row_id)
+def get_subnet(row_id: str):
+    return _c().subnet_repo.get(row_id)
 
 
-def upsert_subnet(row: dict):
-    return _upsert_row("subnets", row)
+def upsert_subnet(row: dict) -> dict:
+    return _c().subnet_repo.upsert(row)
 
 
-def delete_subnet(row_id):
-    _delete_row("subnets", row_id)
+def delete_subnet(row_id: str) -> None:
+    _c().subnet_repo.delete(row_id)
 
 
-def replace_all_subnets(rows: list):
-    _replace_all("subnets", rows)
+def replace_all_subnets(rows: list) -> None:
+    _c().subnet_repo.replace_all(rows)
 
 
-def merge_subnets(rows: list):
-    _merge_rows("subnets", rows)
+def merge_subnets(rows: list) -> None:
+    _c().subnet_repo.merge(rows)
 
 
-def find_subnet_for_ip(ip_str: str, subnets: list = None):
-    """Return the first subnet row whose CIDR contains ip_str, or None.
-    If multiple subnets match, the most specific (longest prefix /
-    smallest range) wins, since that's the conventional CIDR resolution
-    rule and avoids an arbitrary pick when subnets overlap."""
-    if not ip_str:
-        return None
-    try:
-        ip = ipaddress.ip_address(ip_str.strip())
-    except ValueError:
-        return None
-    if subnets is None:
-        subnets = list_subnets()
-    best = None
-    best_prefix = -1
-    for s in subnets:
-        cidr = (s.get("CIDR") or "").strip()
-        if not cidr:
-            continue
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-        except ValueError:
-            continue
-        if ip in net and net.prefixlen > best_prefix:
-            best = s
-            best_prefix = net.prefixlen
-    return best
+def find_subnet_for_ip(ip_str: str, subnets: list | None = None):
+    """Return the most-specific subnet containing ip_str, or None."""
+    return _c().subnet_repo.find_for_ip(ip_str, subnets)
 
 
 # ---------------------------------------------------------------------------
-# Fixed lists (Collector Region only -- see module docstring)
+# Fixed lists
 # ---------------------------------------------------------------------------
-def get_lists():
-    with _lock:
-        rows = _conn.execute("SELECT list_name, items FROM lists").fetchall()
-    return {r["list_name"]: json.loads(r["items"]) for r in rows}
+
+def get_lists() -> dict:
+    return _c().list_repo.get_all()
 
 
-def set_list(list_name, items: list):
-    with _lock:
-        _conn.execute(
-            "INSERT INTO lists (list_name, items) VALUES (?, ?) "
-            "ON CONFLICT(list_name) DO UPDATE SET items = excluded.items",
-            (list_name, json.dumps(items)),
-        )
-        _conn.commit()
+def set_list(list_name: str, items: list) -> None:
+    _c().list_repo.set_list(list_name, items)
 
 
-def list_usage_count(list_name, value):
-    """How many devices currently have `value` set for the field that
-    corresponds to `list_name`. Collector Region is the only fixed list
-    left -- everything else lives in tag_defs and uses tag_value_usage_count."""
-    field_map = {"collectorRegions": "Collector Region"}
-    field = field_map.get(list_name)
-    if not field:
-        return 0
-    count = 0
-    for d in list_devices():
-        if d.get(field) == value:
-            count += 1
-    return count
+def list_usage_count(list_name: str, value: str) -> int:
+    return _c().list_service.usage_count(list_name, value)
 
 
 # ---------------------------------------------------------------------------
 # Dynamic tag definitions
 # ---------------------------------------------------------------------------
-def list_tag_defs():
-    with _lock:
-        rows = _conn.execute("SELECT data FROM tag_defs ORDER BY updated_at ASC").fetchall()
-    return [json.loads(r["data"]) for r in rows]
+
+def list_tag_defs() -> list:
+    return _c().tag_repo.list_all()
 
 
-def get_tag_def(tag_id):
-    with _lock:
-        row = _conn.execute("SELECT data FROM tag_defs WHERE id = ?", (tag_id,)).fetchone()
-    return json.loads(row["data"]) if row else None
+def get_tag_def(tag_id: str):
+    return _c().tag_repo.get(tag_id)
 
 
-def upsert_tag_def(tag_def: dict):
-    """tag_def shape: {id, name, scopes: ["devices","bandwidth","subnets"], values: [...]}"""
-    if not tag_def.get("id"):
-        tag_def["id"] = str(uuid.uuid4())
-    tag_def.setdefault("scopes", [])
-    tag_def.setdefault("values", [])
-    with _lock:
-        _conn.execute(
-            "INSERT INTO tag_defs (id, data, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-            (tag_def["id"], json.dumps(tag_def), time.time()),
-        )
-        _conn.commit()
-    return tag_def
+def upsert_tag_def(tag_def: dict) -> dict:
+    return _c().tag_repo.upsert(tag_def)
 
 
-def delete_tag_def(tag_id):
-    with _lock:
-        _conn.execute("DELETE FROM tag_defs WHERE id = ?", (tag_id,))
-        _conn.commit()
+def delete_tag_def(tag_id: str) -> None:
+    _c().tag_repo.delete(tag_id)
 
 
-_SCOPE_TABLE = {"devices": "devices", "bandwidth": "bandwidth_caps", "subnets": "subnets"}
+def tag_def_usage_count(tag_id: str) -> int:
+    return _c().tag_repo.usage_count(tag_id)
 
 
-def tag_def_usage_count(tag_id):
-    """Total number of records (across all scopes this tag applies to)
-    that currently have a non-empty value set for this tag."""
-    tag_def = get_tag_def(tag_id)
-    if not tag_def:
-        return 0
-    count = 0
-    for scope in tag_def.get("scopes", []):
-        table = _SCOPE_TABLE.get(scope)
-        if not table:
-            continue
-        with _lock:
-            rows = _conn.execute(f"SELECT data FROM {table}").fetchall()
-        for r in rows:
-            data = json.loads(r["data"])
-            if (data.get("tags") or {}).get(tag_id):
-                count += 1
-    return count
-
-
-def tag_value_usage_count(tag_id, value):
-    """How many records currently have this exact value set for this tag."""
-    tag_def = get_tag_def(tag_id)
-    if not tag_def:
-        return 0
-    count = 0
-    for scope in tag_def.get("scopes", []):
-        table = _SCOPE_TABLE.get(scope)
-        if not table:
-            continue
-        with _lock:
-            rows = _conn.execute(f"SELECT data FROM {table}").fetchall()
-        for r in rows:
-            data = json.loads(r["data"])
-            if (data.get("tags") or {}).get(tag_id) == value:
-                count += 1
-    return count
+def tag_value_usage_count(tag_id: str, value: str) -> int:
+    return _c().tag_repo.value_usage_count(tag_id, value)
 
 
 # ---------------------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------------------
-def log_audit(actor, action, details=None):
-    entry_id = str(uuid.uuid4())
-    with _lock:
-        _conn.execute(
-            "INSERT INTO audit_log (id, ts, actor, action, details) VALUES (?, ?, ?, ?, ?)",
-            (entry_id, time.time(), actor or "unknown", action, json.dumps(details) if details is not None else None),
-        )
-        _conn.commit()
-    return entry_id
+
+def log_audit(actor, action: str, details=None) -> str:
+    return _c().audit_repo.log(actor, action, details)
 
 
-def list_audit(limit=100):
-    with _lock:
-        rows = _conn.execute(
-            "SELECT id, ts, actor, action, details FROM audit_log ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "id": r["id"],
-            "ts": now_iso_from_unix(r["ts"]),
-            "actor": r["actor"],
-            "action": r["action"],
-            "details": json.loads(r["details"]) if r["details"] else None,
-        })
-    return out
-
-
-def now_iso_from_unix(ts):
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+def list_audit(limit: int = 100) -> list:
+    return _c().audit_repo.list_recent(limit)
 
 
 # ---------------------------------------------------------------------------
 # YAML history
 # ---------------------------------------------------------------------------
-def save_history(actor, summary, files: dict):
-    entry_id = str(uuid.uuid4())
-    with _lock:
-        _conn.execute(
-            "INSERT INTO yaml_history (id, ts, actor, summary, files) VALUES (?, ?, ?, ?, ?)",
-            (entry_id, time.time(), actor or "unknown", summary, json.dumps(files)),
-        )
-        _conn.commit()
-        _conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('lastSavedAt', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (now_iso(),),
-        )
-        _conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('lastSavedBy', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (actor or "unknown",),
-        )
-        _conn.commit()
+
+def save_history(actor, summary: str, files: dict) -> str:
+    entry_id = _c().history_repo.save(actor, summary, files)
+    # Also update the meta timestamps so the dashboard stays current
+    # (mirrors the original save_history behaviour).
+    from core.repositories.sqlite.base import now_iso as _now_iso
+    _c().meta_repo.set_kv("lastSavedAt", _now_iso())
+    _c().meta_repo.set_kv("lastSavedBy", actor or "unknown")
     return entry_id
 
 
-def list_history(limit=50):
-    with _lock:
-        rows = _conn.execute(
-            "SELECT id, ts, actor, summary FROM yaml_history ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [{"id": r["id"], "ts": now_iso_from_unix(r["ts"]), "actor": r["actor"], "summary": r["summary"]} for r in rows]
+def list_history(limit: int = 50) -> list:
+    return _c().history_repo.list_recent(limit)
 
 
-def get_history_entry(entry_id):
-    with _lock:
-        row = _conn.execute(
-            "SELECT id, ts, actor, summary, files FROM yaml_history WHERE id = ?", (entry_id,)
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "id": row["id"], "ts": now_iso_from_unix(row["ts"]), "actor": row["actor"],
-        "summary": row["summary"], "files": json.loads(row["files"]),
-    }
+def get_history_entry(entry_id: str):
+    return _c().history_repo.get(entry_id)
 
 
 # ---------------------------------------------------------------------------
 # Meta
 # ---------------------------------------------------------------------------
-def get_meta():
-    with _lock:
-        rows = _conn.execute("SELECT key, value FROM meta").fetchall()
-    m = {r["key"]: r["value"] for r in rows}
-    return {
-        "deviceCount": len(list_devices()),
-        "bandwidthCount": len(list_bandwidth()),
-        "subnetCount": len(list_subnets()),
-        "lastSavedAt": m.get("lastSavedAt"),
-        "lastSavedBy": m.get("lastSavedBy"),
-    }
+
+def get_meta() -> dict:
+    return _c().meta_service.get_meta()

@@ -5,8 +5,7 @@
 <p align="center">
   <a href="https://github.com/shivamsancc/ConfigForge"><img alt="repo" src="https://img.shields.io/badge/github-shivamsancc%2FConfigForge-181717?logo=github"></a>
   <img alt="status" src="https://img.shields.io/badge/status-active-brightgreen">
-  <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
-  <img alt="dependencies" src="https://img.shields.io/badge/dependencies-zero-success">
+  <img alt="python" src="https://img.shields.io/badge/python-3.12%2B-blue">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-lightgrey">
 </p>
 
@@ -33,33 +32,159 @@ server running, and if your team lives in pivot tables and conditional formattin
 this won't replace that workflow &mdash; it replaces the "this is also our source of
 truth for monitoring config" part of it.
 
-## Quickstart
+## Getting Started
+
+### Requirements
+
+- Python 3.12+
+- pip packages listed in `requirements.txt` (FastAPI, SQLAlchemy 2.x, Pydantic v2, uvicorn, httpx)
+
+### Installation
+
+```bash
+git clone https://github.com/shivamsancc/ConfigForge.git
+cd ConfigForge
+pip install -r requirements.txt
+```
+
+### Start the server
 
 ```bash
 python3 server.py
 ```
 
-That's it. This starts the server on port 8420 with a local `configforge.db` file
-next to the script, and opens your default browser to it automatically.
+Starts on **`http://localhost:8420/`**, creates `db/configforge.db` automatically, and opens your default browser. Press `Ctrl+C` to stop.
+
+### Custom database path
+
+```bash
+python3 server.py --db /path/to/shared/configforge.db
+```
+
+Point multiple team members at the same file on a shared drive so everyone works from the same dataset.
+
+### Custom host and port
+
+```bash
+python3 server.py --host 0.0.0.0 --port 9000 --no-browser
+```
+
+Default host is `0.0.0.0` (all interfaces). Default port is `8420`.
+
+### All CLI options
+
+```
+python3 server.py --help
+
+  --db PATH         Path to SQLite database file (default: db/configforge.db)
+  --config FILE     Path to a YAML config file (enables PostgreSQL/MySQL/etc.)
+  --port PORT       Port to listen on (default: 8420)
+  --host HOST       Interface to bind (default: 0.0.0.0)
+  --no-browser      Don't open a browser tab on startup
+```
+
+### Development mode (auto-reload)
+
+`server.py` does not pass `--reload` to uvicorn. For live reload during development, create a one-line shim and run uvicorn directly:
+
+```python
+# dev.py
+from app import create_app
+app = create_app(db_path="db/dev.db")
+```
+
+```bash
+uvicorn dev:app --reload --port 8420
+```
+
+Any change to a `.py` file triggers an automatic restart.
+
+### First run walkthrough
 
 From the empty dashboard, three steps to your first generated file:
 
 1. **Manage Lists** &rarr; add a Collector Region (e.g. `aws-mumbai`).
 2. **Devices** &rarr; add a device, assign it that Collector Region.
-3. **Generate YAML** &rarr; click Generate. You now have a YAML file derived from
-   that device.
+3. **Generate YAML** &rarr; click Generate. You now have a YAML file derived from that device.
 
-To point it at a shared network drive so a whole team shares one dataset, or to
-change the port:
+### API explorer (Swagger UI)
+
+FastAPI generates interactive API documentation automatically:
+
+| URL | Description |
+|-----|-------------|
+| `http://localhost:8420/docs` | Swagger UI — try every endpoint in the browser |
+| `http://localhost:8420/redoc` | ReDoc — alternative read-only reference |
+
+### Environment variables
+
+All database settings can be provided via environment variables instead of CLI flags or a YAML file. Each uses the `CONFIGFORGE_DB_` prefix:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONFIGFORGE_DB_PROVIDER` | `sqlite` | Storage backend (`sqlite`, `postgresql`, `mysql`, `sqlserver`) |
+| `CONFIGFORGE_DB_SQLITE_PATH` | `db/configforge.db` | Path to SQLite file (or `:memory:`) |
+| `CONFIGFORGE_DB_CONNECTION_URL` | — | Full SQLAlchemy URL for non-SQLite backends |
+| `CONFIGFORGE_DB_POOL_SIZE` | `5` | Connection pool size |
+| `CONFIGFORGE_DB_MAX_OVERFLOW` | `10` | Max connections above pool size |
+| `CONFIGFORGE_DB_ECHO` | `false` | Log all SQL statements (`true`/`false`) |
+
+Environment variables are read by `AppConfig.from_env()`. To use them with the server, set them before starting:
 
 ```bash
-python3 server.py --db /path/to/shared/configforge.db --port 8420
+CONFIGFORGE_DB_SQLITE_PATH=/mnt/shared/configforge.db python3 server.py
 ```
 
-Run `python3 server.py --help` for the full list of options (`--host`,
-`--no-browser`, etc).
+### YAML config file (advanced)
 
-**Requirements:** Python 3.8+. Nothing else &mdash; no `pip install` needed.
+For non-SQLite backends or to version-control your deployment config, pass a YAML file with `--config`:
+
+```yaml
+# config.yaml
+database:
+  provider: postgresql
+  connection_url: "postgresql+psycopg2://user:pass@db-host:5432/configforge"
+  pool_size: 10
+  max_overflow: 20
+  echo: false
+```
+
+```bash
+python3 server.py --config /etc/configfoundry/config.yaml --port 8420
+```
+
+If `--db` is also supplied alongside `--config`, it overrides `sqlite_path` in the YAML. Passwords in connection URLs are masked in console output.
+
+See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full config reference and a guide to adding new database backends.
+
+### Production startup
+
+For production, bypass `server.py` and run uvicorn directly with multiple workers:
+
+```bash
+# Create a module-level app instance first (e.g. wsgi.py):
+# from app import create_app
+# from core.storage.config import AppConfig
+# app = create_app(config=AppConfig.from_env())
+
+uvicorn wsgi:app \
+  --host 0.0.0.0 \
+  --port 8420 \
+  --workers 4 \
+  --log-level warning \
+  --no-access-log
+```
+
+Or with gunicorn and the uvicorn worker class:
+
+```bash
+gunicorn wsgi:app \
+  -k uvicorn.workers.UvicornWorker \
+  --bind 0.0.0.0:8420 \
+  --workers 4
+```
+
+Put a reverse proxy (nginx, Caddy, Traefik) in front for TLS termination, rate limiting, and access control.
 
 ## Features
 
@@ -152,11 +277,7 @@ and zoom around a few hundred devices without losing your place.
   it (a one-time name prompt, required and remembered permanently in your
   browser, not a login system), and every generation is saved so you can look
   back at what was produced and when.
-- **Zero pip dependencies.** Everything &mdash; the HTTP server, the SQLite
-  storage layer, AES-256-GCM credential encryption, the YAML serializer, and the
-  `.xlsx` reader/writer &mdash; is implemented against the Python standard library
-  only. This is deliberate: ConfigForge is built to run on a locked-down machine
-  with no internet access and no ability to `pip install` anything.
+- **Minimal, well-known dependencies.** The backend runs on FastAPI, SQLAlchemy 2.x, Pydantic v2, and uvicorn — all installable with a single `pip install -r requirements.txt`. AES-256-GCM credential encryption and the YAML serializer remain pure-Python with no additional dependencies.
 - **Safe upgrades.** Every schema change ships as a versioned, idempotent
   migration that runs automatically on server startup (see
   [Upgrading](#upgrading) below) &mdash; updating to a new version is just
@@ -183,12 +304,7 @@ whether it fits:
   not editing the same device simultaneously) this hasn't been a problem in
   practice, but it's not battle-tested under heavy concurrent write load and
   you should know that going in.
-- **No automated test suite is committed to the repo yet.** Every module here
-  was verified by hand during development &mdash; `yamldump.py` and
-  `aesgcm.py` against PyYAML and pycryptodome across thousands of randomized
-  trials, the frontend against a real browser driving real interactions. None
-  of that is currently captured as a repeatable `tests/` directory you can
-  run yourself. Contributions that add one are very welcome.
+- **Test suite covers the backend only.** The `tests/` directory contains 334 passing tests across repositories, services, handlers, and the storage abstraction layer. Frontend behaviour is still verified by hand against a real browser.
 
 ## Upgrading
 
@@ -226,45 +342,54 @@ behind a reverse proxy or VPN.
 
 ## Architecture
 
-The backend is split by responsibility, not by layer convention: `logic.py` holds
-the actual device-to-YAML conversion as pure functions with no HTTP or database
-code in it, specifically so it can be reasoned about (and tested) without spinning
-up a server. `storage.py` is the only file that touches SQLite. `handler.py` is
-the only file that knows about HTTP. If you're adding a new entity type alongside
-Devices/Bandwidth/Subnets, the pattern to follow is: a table in `storage.py`, a
-migration in `migrations.py`, routes in `handler.py`, a `<name>.js` view that
-follows the same shape as `subnets.js` (the simplest existing example), and tag
-support via `tagfields.js` if it should be taggable.
+The backend follows a layered architecture introduced in v0.5. Each layer has a single responsibility and depends only on the layer below it through well-defined interfaces.
 
 ```
-server.py          entry point -- argument parsing, runs migrations, opens the browser, starts the HTTP server
-handler.py         REST API (devices/bandwidth/subnets/tags/lists/audit/history/generate/export)
-storage.py         SQLite (WAL mode), credential encryption, CIDR matching, usage-count helpers
-migrations.py      versioned, idempotent schema migrations -- see "Upgrading" above
-logic.py           core conversion: groups devices by Collector Region, resolves tags, builds YAML-ready dicts
-yamldump.py        pure-Python YAML serializer matching PyYAML's default output
-aesgcm.py          pure-Python AES-256-GCM (zero dependencies)
-xlsxwriter.py       pure-Python .xlsx writer (zero dependencies)
+HTTP layer       FastAPI routes (api/) — receive requests, validate with Pydantic v2, call services
+Service layer    core/services/ — pure business logic, no HTTP or DB code
+Repository layer core/repositories/ — data access via ABC interfaces; SQLAlchemy implementations
+Storage layer    core/storage/ — StorageProvider ABC + factory; SQLiteProvider (full), PostgreSQL/MySQL/SQL Server (scaffolds)
+```
+
+The `StorageProvider` abstraction means repositories never import a database driver directly. Swapping the backend is a config change, not a code change.
+
+```
+server.py                    entry point — CLI args, AppConfig assembly, uvicorn startup
+app.py                       FastAPI application factory (create_app)
+core/
+  container.py               DI container — wires provider → repos → services
+  storage/
+    provider.py              StorageProvider ABC, HealthCheckResult, ProviderCapabilities
+    config.py                DatabaseConfig, AppConfig (YAML / env / dict constructors)
+    factory.py               StorageFactory registry (sqlite, postgresql, mysql, sqlserver + aliases)
+    providers/
+      sqlite.py              SQLiteProvider — fully functional (WAL mode, migrations, seeding)
+      postgresql.py          PostgreSQLProvider — scaffold (interface-compliant, initialize() raises)
+      mysql.py               MySQLProvider — scaffold
+      sqlserver.py           SQLServerProvider — scaffold
+  repositories/
+    interfaces/              ABC interfaces for every entity (IDeviceRepository, etc.)
+    sqlalchemy/              SQLAlchemy 2.x implementations (8 repos, all accept StorageProvider)
+  services/                  Business logic services (DeviceService, GenerateService, etc.)
+api/
+  dependencies.py            Depends(get_container) — resolves ServiceContainer from request.app.state
+  devices.py  bandwidth.py   FastAPI routers (one per entity)
+  subnets.py  tags.py  …
+schemas/common.py            Pydantic v2 request/response models
+migrations.py                Versioned, idempotent SQLite schema migrations
+logic.py                     Core YAML conversion — pure functions, no HTTP or DB code
+aesgcm.py                    AES-256-GCM credential encryption
 static/
-  app.js            shell: routing, global state, sidebar/topbar, theme toggle
-  devices.js         Devices view
-  bandwidth.js        Bandwidth Capping view
-  subnets.js          Subnets view
-  tags.js             Manage Tags view (create/scope/delete tag definitions)
-  lists.js            Manage Lists view (Collector Region + every tag's value list)
-  networktree.js      Network Tree: the pan/zoom diagram, filtering, hover-trace, details popups
-  tablecontrols.js     shared client-side sort + pagination, used by Devices/Bandwidth/Subnets
-  tagfields.js         shared dynamic-tag rendering, used by every section's forms and tables
-  dashboard.js         Dashboard view
-  generate.js          Generate YAML view
-  history.js / audit.js  YAML History / Audit Log views
-  api.js              thin fetch() wrapper for every backend endpoint
-  ui.js               icons, toasts, modals, shared helpers
+  app.js                     Shell: routing, global state, sidebar/topbar, theme toggle
+  devices.js  bandwidth.js   Entity views
+  networktree.js             Pan/zoom network diagram
+  api.js                     Thin fetch() wrapper for every backend endpoint
+  ui.js                      Icons, toasts, modals, shared helpers
 ```
 
-The frontend is intentionally framework-free &mdash; plain HTML/CSS/JS served as
-static files, with [SheetJS](https://sheetjs.com/) vendored locally for `.xlsx`
-parsing. There's no build step: edit a `.js` file, refresh the browser.
+The frontend is intentionally framework-free — plain HTML/CSS/JS served as static files, with [SheetJS](https://sheetjs.com/) vendored locally for `.xlsx` parsing. There's no build step: edit a `.js` file, refresh the browser.
+
+See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full Storage Abstraction Layer reference, including how to add a new database backend in five steps.
 
 ## REST API
 
@@ -283,8 +408,7 @@ All endpoints are under `/api/`. A few representative examples:
 | `POST` | `/api/generate` | Generate YAML from current data, save a history entry |
 | `GET` | `/api/export/devices.xlsx` | Download devices as an Excel template |
 
-See the docstring at the top of `handler.py` for the complete request/response
-contract.
+The complete request/response contract is available interactively at **`http://localhost:8420/docs`** (Swagger UI) once the server is running. Every endpoint is documented with its expected body, parameters, and response shape.
 
 ## Contributing
 
@@ -298,13 +422,8 @@ convenience &mdash; a new pip dependency, a build step, an assumption that the
 internet is reachable &mdash; expect pushback on the tradeoff, not the code
 itself. A few more specific things worth knowing before you dive in:
 
-- **Any schema change goes in `migrations.py`**, never as an ad-hoc `ALTER` in
-  `storage.py`. Add a new numbered `migrate_N` function; never edit an existing
-  one after release.
-- Keep the zero-pip-dependency constraint for anything in the backend that ships
-  by default &mdash; it's the whole point of the project working on locked-down
-  machines. If you need a real dependency for an optional feature, gate it behind
-  a try/except with a clear fallback message.
+- **Any schema change goes in `migrations.py`**, never as an ad-hoc `ALTER` in a repository or provider. Add a new numbered `migrate_N` function; never edit an existing one after release. If you're adding a new entity type alongside Devices/Bandwidth/Subnets, the pattern is: migration in `migrations.py`, ORM model in `models/`, ABC interface in `core/repositories/interfaces/`, SQLAlchemy implementation in `core/repositories/sqlalchemy/`, service in `core/services/`, FastAPI router in `api/`, Pydantic schemas in `schemas/`, wired up in `core/container.py`, and a JS view in `static/` following `subnets.js` as the simplest template.
+- Keep new pip dependencies to a minimum. The core stack (FastAPI, SQLAlchemy, Pydantic, uvicorn) is established; anything new needs a strong justification. Optional-feature dependencies should be gated behind a `try/except` with a clear fallback message.
 - The frontend has no build step on purpose. Please don't introduce one without
   discussing it first &mdash; that's a deliberate tradeoff, not an oversight.
 - `yamldump.py` and `aesgcm.py` are both verified against their "real"
