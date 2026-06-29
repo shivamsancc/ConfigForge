@@ -34,25 +34,44 @@ To add a future version alongside v1::
 
 Both versions then coexist; callers choose by URL prefix.
 See ``docs/api-versioning.md`` for the full guide.
+
+Middleware order
+----------------
+Starlette prepends middleware: the last ``add_middleware()`` call runs FIRST.
+We must register them in this order::
+
+    app.add_middleware(RequestLoggingMiddleware)   # added first → runs second
+    app.add_middleware(CorrelationIDMiddleware)    # added last  → runs first
+
+This ensures every log line emitted by RequestLoggingMiddleware (and all
+code below it) already carries the correlation ID.
 """
 from __future__ import annotations
 
 import os
-import traceback
+import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from api.v1.router import router as v1_router
+from api.v1.router import PREFIX as V1_PREFIX, VERSION as V1_VERSION, router as v1_router
 from core.container import ServiceContainer
+from core.logging import get_logger
+from core.logging.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware
+from core.logging.startup import log_shutdown_info, log_startup_info
 from core.storage.config import AppConfig
 
 # ---------------------------------------------------------------------------
 # Application version — bump this on every release.
 # ---------------------------------------------------------------------------
 APP_VERSION = "0.5.0"
+
+# Module-level logger (obtained after configure_logging() is called in
+# server.py — safe because loggers are created lazily).
+_logger = get_logger(__name__)
 
 
 def create_app(
@@ -82,12 +101,61 @@ def create_app(
         Directory to serve static files from.  Defaults to the ``static/``
         folder next to this file.
     """
+    _t_start = time.perf_counter()
+
     _given = sum(x is not None for x in (db_path, container, config))
     if _given == 0:
         raise ValueError("create_app() requires one of: db_path, container, or config")
     if _given > 1:
         raise ValueError("create_app() accepts only one of: db_path, container, or config")
 
+    # ------------------------------------------------------------------
+    # Build the service container BEFORE FastAPI so we can read provider
+    # metadata in the lifespan handler.
+    # ------------------------------------------------------------------
+    if container is not None:
+        _container = container
+        _log_config = None
+    elif config is not None:
+        _container = ServiceContainer(config=config)
+        _log_config = config.logging
+    else:
+        _container = ServiceContainer(db_path=db_path)
+        _log_config = None
+
+    # ------------------------------------------------------------------
+    # Lifespan — startup and shutdown logging
+    # ------------------------------------------------------------------
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        # ---- startup ----
+        try:
+            provider_meta = _container._provider.get_metadata()
+        except Exception:
+            provider_meta = {}
+
+        log_startup_info(
+            app_version=APP_VERSION,
+            api_version=V1_VERSION,
+            api_prefix=V1_PREFIX,
+            provider_meta=provider_meta,
+            log_config=_log_config,
+            startup_duration_s=time.perf_counter() - _t_start,
+        )
+
+        yield
+
+        # ---- shutdown ----
+        try:
+            provider_meta = _container._provider.get_metadata()
+        except Exception:
+            provider_meta = {}
+
+        log_shutdown_info(provider_meta=provider_meta)
+
+    # ------------------------------------------------------------------
+    # FastAPI application
+    # ------------------------------------------------------------------
     app = FastAPI(
         title="ConfigFoundry — API v1",
         description=(
@@ -96,6 +164,7 @@ def create_app(
             "Interactive docs: [Swagger UI](/docs) · [ReDoc](/redoc)"
         ),
         version=APP_VERSION,
+        lifespan=_lifespan,
         openapi_tags=[
             {"name": "devices",   "description": "Network device inventory"},
             {"name": "bandwidth", "description": "Interface bandwidth caps"},
@@ -110,26 +179,31 @@ def create_app(
         ],
     )
 
-    # ------------------------------------------------------------------
-    # Resolve / build the service container
-    # ------------------------------------------------------------------
-    if container is not None:
-        app.state.container = container
-    elif config is not None:
-        app.state.container = ServiceContainer(config=config)
-    else:
-        app.state.container = ServiceContainer(db_path=db_path)
+    # Store container on app.state for DI (api/dependencies.py reads this).
+    app.state.container = _container
 
     # ------------------------------------------------------------------
     # Global exception handler — always return JSON on unhandled errors
     # ------------------------------------------------------------------
     @app.exception_handler(Exception)
     async def _generic_error(request: Request, exc: Exception):
-        traceback.print_exc()
+        _logger.error(
+            "Unhandled %s on %s %s",
+            type(exc).__name__,
+            request.method,
+            request.url.path,
+            exc_info=True,
+        )
         return JSONResponse(
             {"error": str(exc), "type": type(exc).__name__},
             status_code=500,
         )
+
+    # ------------------------------------------------------------------
+    # Middleware  (LAST added = FIRST to run)
+    # ------------------------------------------------------------------
+    app.add_middleware(RequestLoggingMiddleware)   # added first → runs second
+    app.add_middleware(CorrelationIDMiddleware)    # added last  → runs first
 
     # ------------------------------------------------------------------
     # API v1 router  (all endpoints under /api/v1/)
@@ -137,7 +211,7 @@ def create_app(
     app.include_router(v1_router, prefix="/api")
 
     # ------------------------------------------------------------------
-    # Static file serving
+    # Static file serving  (MUST come after all include_router calls)
     # ------------------------------------------------------------------
     _static = static_dir or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "static"

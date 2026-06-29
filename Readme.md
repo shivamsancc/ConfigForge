@@ -129,10 +129,25 @@ All database settings can be provided via environment variables instead of CLI f
 | `CONFIGFORGE_DB_MAX_OVERFLOW` | `10` | Max connections above pool size |
 | `CONFIGFORGE_DB_ECHO` | `false` | Log all SQL statements (`true`/`false`) |
 
+Logging is configured separately with `CONFIGFORGE_LOG_*` variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONFIGFORGE_LOG_LEVEL` | `INFO` | Minimum log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
+| `CONFIGFORGE_LOG_FILE` | — | Log file path; omit for console-only |
+| `CONFIGFORGE_LOG_CONSOLE` | `true` | Write to stderr (`true`/`false`) |
+| `CONFIGFORGE_LOG_JSON` | `false` | Emit JSON lines instead of human-readable text |
+| `CONFIGFORGE_LOG_ROTATION` | `daily` | `daily`, `size`, or `none` |
+| `CONFIGFORGE_LOG_BACKUP_COUNT` | `7` | Number of rotated files to keep |
+| `CONFIGFORGE_LOG_MAX_BYTES` | `10485760` | Max file size before rotation (rotation=size only) |
+
 Environment variables are read by `AppConfig.from_env()`. To use them with the server, set them before starting:
 
 ```bash
-CONFIGFORGE_DB_SQLITE_PATH=/mnt/shared/configforge.db python3 server.py
+CONFIGFORGE_DB_SQLITE_PATH=/mnt/shared/configforge.db \
+CONFIGFORGE_LOG_FILE=logs/configfoundry.log \
+CONFIGFORGE_LOG_LEVEL=DEBUG \
+python3 server.py
 ```
 
 ### YAML config file (advanced)
@@ -147,6 +162,14 @@ database:
   pool_size: 10
   max_overflow: 20
   echo: false
+
+logging:
+  level: INFO
+  file: logs/configfoundry.log
+  console: true
+  rotation: daily         # daily | size | none
+  backup_count: 7
+  json_format: false      # true to emit JSON lines for log aggregators
 ```
 
 ```bash
@@ -155,7 +178,7 @@ python3 server.py --config /etc/configfoundry/config.yaml --port 8420
 
 If `--db` is also supplied alongside `--config`, it overrides `sqlite_path` in the YAML. Passwords in connection URLs are masked in console output.
 
-See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full config reference and a guide to adding new database backends.
+See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full storage config reference and a guide to adding new database backends. See [`docs/logging.md`](docs/logging.md) for the full logging reference.
 
 ### Production startup
 
@@ -304,7 +327,7 @@ whether it fits:
   not editing the same device simultaneously) this hasn't been a problem in
   practice, but it's not battle-tested under heavy concurrent write load and
   you should know that going in.
-- **Test suite covers the backend only.** The `tests/` directory contains 334 passing tests across repositories, services, handlers, and the storage abstraction layer. Frontend behaviour is still verified by hand against a real browser.
+- **Test suite covers the backend only.** The `tests/` directory contains 447 passing tests across repositories, services, handlers, the storage abstraction layer, and the logging framework. Frontend behaviour is still verified by hand against a real browser.
 
 ## Upgrading
 
@@ -349,15 +372,25 @@ HTTP layer       FastAPI routes (api/) — receive requests, validate with Pydan
 Service layer    core/services/ — pure business logic, no HTTP or DB code
 Repository layer core/repositories/ — data access via ABC interfaces; SQLAlchemy implementations
 Storage layer    core/storage/ — StorageProvider ABC + factory; SQLiteProvider (full), PostgreSQL/MySQL/SQL Server (scaffolds)
+Logging layer    core/logging/ — centralized logging, structured output, correlation IDs, log rotation
 ```
 
-The `StorageProvider` abstraction means repositories never import a database driver directly. Swapping the backend is a config change, not a code change.
+The `StorageProvider` abstraction means repositories never import a database driver directly. Swapping the backend is a config change, not a code change. The logging framework means every component emits structured, correlated records through one root logger — no `logging.basicConfig()` anywhere.
 
 ```
-server.py                    entry point — CLI args, AppConfig assembly, uvicorn startup
-app.py                       FastAPI application factory (create_app)
+server.py                    entry point — CLI args, AppConfig assembly, configure_logging(), uvicorn startup
+app.py                       FastAPI application factory (create_app, lifespan, middleware)
 core/
   container.py               DI container — wires provider → repos → services
+  logging/
+    __init__.py              Public API: configure_logging(), get_logger(), get_request_id(), …
+    config.py                LoggingConfig (YAML / env / defaults)
+    context.py               ContextVar-based request ID propagation
+    factory.py               get_logger(__name__)  →  configfoundry.* namespace
+    formatters.py            ConfigFoundryFormatter (text) + JSONFormatter
+    handlers.py              build_console_handler(), build_file_handler() with rotation
+    middleware.py            CorrelationIDMiddleware + RequestLoggingMiddleware
+    startup.py               log_startup_info(), log_shutdown_info()
   storage/
     provider.py              StorageProvider ABC, HealthCheckResult, ProviderCapabilities
     config.py                DatabaseConfig, AppConfig (YAML / env / dict constructors)
@@ -373,8 +406,10 @@ core/
   services/                  Business logic services (DeviceService, GenerateService, etc.)
 api/
   dependencies.py            Depends(get_container) — resolves ServiceContainer from request.app.state
-  devices.py  bandwidth.py   FastAPI routers (one per entity)
-  subnets.py  tags.py  …
+  v1/
+    router.py                Central v1 router (prefix="/v1", VERSION="v1", PREFIX="/api/v1")
+    devices.py  bandwidth.py FastAPI routers (one per entity)
+    subnets.py  tags.py  …
 schemas/common.py            Pydantic v2 request/response models
 migrations.py                Versioned, idempotent SQLite schema migrations
 logic.py                     Core YAML conversion — pure functions, no HTTP or DB code
@@ -389,7 +424,21 @@ static/
 
 The frontend is intentionally framework-free — plain HTML/CSS/JS served as static files, with [SheetJS](https://sheetjs.com/) vendored locally for `.xlsx` parsing. There's no build step: edit a `.js` file, refresh the browser.
 
-See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full Storage Abstraction Layer reference, including how to add a new database backend in five steps.
+See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full Storage Abstraction Layer reference, including how to add a new database backend in five steps. See [`docs/logging.md`](docs/logging.md) for the full logging framework reference.
+
+## Logging
+
+Every request is tagged with a 12-character hex correlation ID (`X-Request-ID` header) that appears in every log line emitted during that request. The access log line looks like:
+
+```
+2024-01-15 10:30:45 INFO     configfoundry.http    [a3f8c2d1e5b4] GET /api/v1/devices → 200 (12.3ms) ip=127.0.0.1
+```
+
+All application code acquires a logger with `get_logger(__name__)` from `core.logging`. The `configure_logging()` function is called once in `server.py` before `create_app()`, reads from `AppConfig.logging` (populated from the YAML `logging:` section or `CONFIGFORGE_LOG_*` env vars), and attaches handlers to the single `configfoundry` root logger. No module calls `logging.basicConfig()` directly.
+
+Request bodies are never logged. Exceptions are logged with full traceback on the server; clients receive only `{"error": "...", "type": "..."}`.
+
+See [`docs/logging.md`](docs/logging.md) for the complete reference: configuration, log formats (text and JSON), correlation IDs, rotation modes, audit log separation design, and how to add a new log destination.
 
 ## API Versioning
 

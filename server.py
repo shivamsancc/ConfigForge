@@ -27,6 +27,7 @@ import webbrowser
 import uvicorn
 
 from app import create_app
+from core.logging import configure_logging
 from core.storage.config import AppConfig, DatabaseConfig
 
 
@@ -107,6 +108,10 @@ def open_browser_when_ready(url: str, host: str, port: int):
 def main():
     args = parse_args()
     config = build_config(args)
+
+    # Configure logging FIRST — before create_app() so that startup log
+    # messages emitted from the lifespan handler are already captured.
+    configure_logging(config.logging)
 
     display_host = "localhost" if args.host == "0.0.0.0" else args.host
     url = f"http://{display_host}:{args.port}/"

@@ -7,7 +7,7 @@ backend.  ``AppConfig`` is the application-level configuration root.
 Loading priority (highest wins)
 ---------------------------------
 1. Explicit constructor kwargs / ``from_dict()``
-2. Environment variables (``CONFIGFORGE_DB_*``)
+2. Environment variables (``CONFIGFORGE_DB_*``, ``CONFIGFORGE_LOG_*``)
 3. YAML configuration file (``--config`` flag or ``CONFIGFORGE_CONFIG`` env var)
 4. Built-in defaults
 
@@ -20,6 +20,8 @@ Environment variables
 ``CONFIGFORGE_DB_MAX_OVERFLOW`` — integer, pool overflow (default 10)
 ``CONFIGFORGE_DB_ECHO``         — true | false, SQLAlchemy statement logging
 
+See ``core/logging/config.py`` for ``CONFIGFORGE_LOG_*`` variables.
+
 YAML example
 ------------
 ::
@@ -27,6 +29,13 @@ YAML example
     database:
       provider: sqlite
       sqlite_path: ./db/configforge.db
+
+    logging:
+      level: INFO
+      file: logs/configfoundry.log
+      console: true
+      rotation: daily
+      backup_count: 7
 
     # or for PostgreSQL (future):
     database:
@@ -40,6 +49,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+from core.logging.config import LoggingConfig
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +142,18 @@ class AppConfig:
     """
     Top-level configuration object for ConfigFoundry.
 
-    Currently only contains ``database`` settings; structured to grow
-    with future sections (logging, auth, feature flags, etc.).
+    Attributes
+    ----------
+    database:
+        Database connection parameters.
+    logging:
+        Logging framework configuration (level, file, rotation, etc.).
+        Parsed from the ``logging:`` section of the YAML config file or
+        ``CONFIGFORGE_LOG_*`` environment variables.
     """
 
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     # ------------------------------------------------------------------
     # Factory class-methods
@@ -144,17 +162,25 @@ class AppConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
         """Build an ``AppConfig`` from a nested dictionary."""
-        db_data = data.get("database", {})
-        return cls(database=DatabaseConfig.from_dict(db_data))
+        db_data  = data.get("database", {})
+        log_data = data.get("logging", {})
+        return cls(
+            database=DatabaseConfig.from_dict(db_data),
+            logging=LoggingConfig.from_dict(log_data),
+        )
 
     @classmethod
     def from_env(cls) -> "AppConfig":
         """
         Build an ``AppConfig`` from environment variables.
 
-        Reads ``CONFIGFORGE_DB_*`` for the database section.
+        Reads ``CONFIGFORGE_DB_*`` for the database section and
+        ``CONFIGFORGE_LOG_*`` for the logging section.
         """
-        return cls(database=DatabaseConfig.from_env())
+        return cls(
+            database=DatabaseConfig.from_env(),
+            logging=LoggingConfig.from_env(),
+        )
 
     @classmethod
     def from_yaml(cls, path: str) -> "AppConfig":
