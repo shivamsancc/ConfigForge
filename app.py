@@ -22,8 +22,18 @@ Reuse an existing ``ServiceContainer`` (e.g. in tests that also call
     from app import create_app
     app = create_app(container=existing_container)
 
-The factory pattern lets ``server.py`` create the production app, while
-test fixtures can spin up isolated apps backed by temporary databases.
+API versioning
+--------------
+All REST endpoints live under ``/api/v1/``.  The v1 router is assembled in
+``api/v1/router.py`` and included here under the ``/api`` prefix.
+
+To add a future version alongside v1::
+
+    from api.v2.router import router as v2_router
+    app.include_router(v2_router, prefix="/api")
+
+Both versions then coexist; callers choose by URL prefix.
+See ``docs/api-versioning.md`` for the full guide.
 """
 from __future__ import annotations
 
@@ -35,18 +45,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from api.devices import router as devices_router
-from api.bandwidth import router as bandwidth_router
-from api.subnets import router as subnets_router
-from api.tags import router as tags_router
-from api.lists import router as lists_router
-from api.generate import router as generate_router
-from api.audit import router as audit_router
-from api.history import router as history_router
-from api.meta import router as meta_router
-from api.export import router as export_router
+from api.v1.router import router as v1_router
 from core.container import ServiceContainer
 from core.storage.config import AppConfig
+
+# ---------------------------------------------------------------------------
+# Application version — bump this on every release.
+# ---------------------------------------------------------------------------
+APP_VERSION = "0.5.0"
 
 
 def create_app(
@@ -83,9 +89,25 @@ def create_app(
         raise ValueError("create_app() accepts only one of: db_path, container, or config")
 
     app = FastAPI(
-        title="ConfigFoundry",
-        description="Shared SNMP collector config YAML generator",
-        version="0.5.0",
+        title="ConfigFoundry — API v1",
+        description=(
+            "Shared SNMP/ICMP collector config YAML generator.\n\n"
+            "All endpoints are versioned under `/api/v1/`. "
+            "Interactive docs: [Swagger UI](/docs) · [ReDoc](/redoc)"
+        ),
+        version=APP_VERSION,
+        openapi_tags=[
+            {"name": "devices",   "description": "Network device inventory"},
+            {"name": "bandwidth", "description": "Interface bandwidth caps"},
+            {"name": "subnets",   "description": "Subnet definitions and CIDR blocks"},
+            {"name": "tags",      "description": "Dynamic tag definitions"},
+            {"name": "lists",     "description": "Managed value lists (Collector Region, etc.)"},
+            {"name": "generate",  "description": "YAML config generation"},
+            {"name": "audit",     "description": "Audit log"},
+            {"name": "history",   "description": "YAML generation history"},
+            {"name": "meta",      "description": "Inventory metadata and statistics"},
+            {"name": "export",    "description": "Excel export"},
+        ],
     )
 
     # ------------------------------------------------------------------
@@ -110,21 +132,9 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
-    # API routers  (all mounted under /api)
+    # API v1 router  (all endpoints under /api/v1/)
     # ------------------------------------------------------------------
-    for r in [
-        devices_router,
-        bandwidth_router,
-        subnets_router,
-        tags_router,
-        lists_router,
-        generate_router,
-        audit_router,
-        history_router,
-        meta_router,
-        export_router,
-    ]:
-        app.include_router(r, prefix="/api")
+    app.include_router(v1_router, prefix="/api")
 
     # ------------------------------------------------------------------
     # Static file serving

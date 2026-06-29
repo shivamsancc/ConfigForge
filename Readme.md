@@ -391,22 +391,86 @@ The frontend is intentionally framework-free — plain HTML/CSS/JS served as sta
 
 See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full Storage Abstraction Layer reference, including how to add a new database backend in five steps.
 
+## API Versioning
+
+All REST endpoints are versioned under `/api/v1/`. The version is part of the URL, not a header, so different versions can coexist on the same running server.
+
+### Current endpoints (v1)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/devices` | List all devices |
+| `POST` | `/api/v1/devices` | Create or update a device |
+| `DELETE` | `/api/v1/devices/{id}` | Delete a device |
+| `POST` | `/api/v1/devices/validate-import` | Validate a bulk device import (no DB write) |
+| `POST` | `/api/v1/devices/import` | Bulk import (merge or replace) |
+| `GET` | `/api/v1/bandwidth` | List all bandwidth rows |
+| `GET` | `/api/v1/subnets` | List all subnets |
+| `GET` | `/api/v1/tags` | List all tag definitions |
+| `POST` | `/api/v1/generate` | Generate YAML from current data |
+| `GET` | `/api/v1/export/devices.xlsx` | Download devices as Excel |
+
+The full list is available at **`http://localhost:8420/docs`** (Swagger UI).
+
+### How to add v2
+
+1. Create `api/v2/` with the same layout as `api/v1/`:
+   ```
+   api/v2/__init__.py
+   api/v2/router.py          # APIRouter(prefix="/v2"), includes sub-routers
+   api/v2/devices.py         # override or extend endpoint behaviour
+   # … other modules as needed
+   ```
+
+2. In `api/v2/router.py`, define or import the new endpoint logic:
+   ```python
+   from fastapi import APIRouter
+   from api.v2 import devices   # new v2 implementation
+   # optionally re-export unchanged v1 routers:
+   from api.v1 import bandwidth, subnets, ...
+
+   router = APIRouter(prefix="/v2")
+   router.include_router(devices.router,   tags=["v2-devices"])
+   router.include_router(bandwidth.router, tags=["bandwidth"])
+   ```
+
+3. Register the new router in `app.py` alongside v1:
+   ```python
+   from api.v1.router import router as v1_router
+   from api.v2.router import router as v2_router
+
+   app.include_router(v1_router, prefix="/api")
+   app.include_router(v2_router, prefix="/api")
+   ```
+   Both versions coexist under the same FastAPI app. The combined OpenAPI spec at `/docs` shows `/api/v1/` and `/api/v2/` paths side by side.
+
+4. **Mount `StaticFiles` last** — after all `include_router` calls — so the catch-all static handler does not shadow the new versioned routes.
+
+### Versioning rules
+
+- Business logic lives in `core/services/`. Routers only translate HTTP ↔ service calls. Changing behaviour in v2 means writing new service methods or new service classes — not touching v1 routers.
+- Schemas live in `schemas/`. A v2 router can use different Pydantic models while the underlying services remain the same.
+- Never modify a v1 router after it ships — create v2 instead.
+- Version-specific tests live in `tests/api/test_versioning.py`.
+
+---
+
 ## REST API
 
-All endpoints are under `/api/`. A few representative examples:
+All endpoints are under `/api/v1/`. A few representative examples:
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/devices` | List all devices |
-| `POST` | `/api/devices` | Create or update a device |
-| `DELETE` | `/api/devices/{id}` | Delete a device |
-| `POST` | `/api/devices/import` | Bulk import (merge or replace) |
-| `GET` | `/api/subnets` | List all subnets |
-| `GET` | `/api/tags` | List all tag definitions |
-| `POST` | `/api/tags` | Create or update a tag definition |
-| `DELETE` | `/api/tags/{id}` | Delete a tag (409 if in use, unless `?force=true`) |
-| `POST` | `/api/generate` | Generate YAML from current data, save a history entry |
-| `GET` | `/api/export/devices.xlsx` | Download devices as an Excel template |
+| `GET` | `/api/v1/devices` | List all devices |
+| `POST` | `/api/v1/devices` | Create or update a device |
+| `DELETE` | `/api/v1/devices/{id}` | Delete a device |
+| `POST` | `/api/v1/devices/import` | Bulk import (merge or replace) |
+| `GET` | `/api/v1/subnets` | List all subnets |
+| `GET` | `/api/v1/tags` | List all tag definitions |
+| `POST` | `/api/v1/tags` | Create or update a tag definition |
+| `DELETE` | `/api/v1/tags/{id}` | Delete a tag (409 if in use, unless `?force=true`) |
+| `POST` | `/api/v1/generate` | Generate YAML from current data, save a history entry |
+| `GET` | `/api/v1/export/devices.xlsx` | Download devices as an Excel template |
 
 The complete request/response contract is available interactively at **`http://localhost:8420/docs`** (Swagger UI) once the server is running. Every endpoint is documented with its expected body, parameters, and response shape.
 

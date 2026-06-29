@@ -8,9 +8,9 @@ the same database as the HTTP layer.
 
 Endpoints exercised
 -------------------
-POST /api/devices/validate-import   body: {"devices": [...]}
-POST /api/bandwidth/validate-import body: {"rows": [...]}
-POST /api/subnets/validate-import   body: {"subnets": [...]}
+POST /api/v1/devices/validate-import   body: {"devices": [...]}
+POST /api/v1/bandwidth/validate-import body: {"rows": [...]}
+POST /api/v1/subnets/validate-import   body: {"subnets": [...]}
 
 Contracts verified
 ------------------
@@ -118,7 +118,7 @@ class TestValidateImportDevices(unittest.TestCase):
         cls._srv.stop()
 
     def _post(self, payload):
-        return self._srv.post('/api/devices/validate-import', payload)
+        return self._srv.post('/api/v1/devices/validate-import', payload)
 
     # --- HTTP contract ---
 
@@ -236,7 +236,7 @@ class TestValidateImportBandwidth(unittest.TestCase):
         cls._srv.stop()
 
     def _post(self, payload):
-        return self._srv.post('/api/bandwidth/validate-import', payload)
+        return self._srv.post('/api/v1/bandwidth/validate-import', payload)
 
     def test_returns_200_with_findings_key(self):
         status, data = self._post({'rows': [_clean_bw_row()]})
@@ -296,7 +296,7 @@ class TestValidateImportSubnets(unittest.TestCase):
         cls._srv.stop()
 
     def _post(self, payload):
-        return self._srv.post('/api/subnets/validate-import', payload)
+        return self._srv.post('/api/v1/subnets/validate-import', payload)
 
     def test_returns_200_with_findings_key(self):
         status, data = self._post({'subnets': [_clean_subnet()]})
