@@ -57,7 +57,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
-from core import storage, logic
+from core import storage, logic, validator, diff as differ
 from formats import yamldump, xlsxwriter
 
 STATIC_DIR = None  # set by server.py before serving
@@ -214,16 +214,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upsert_device(body, actor)
             if path == "/api/devices/import":
                 return self._import_rows(body, actor, scope="devices")
+            if path == "/api/devices/validate-import":
+                return self._validate_import_rows(body, scope="devices")
 
             if path == "/api/bandwidth":
                 return self._upsert_bandwidth(body, actor)
             if path == "/api/bandwidth/import":
                 return self._import_rows(body, actor, scope="bandwidth")
+            if path == "/api/bandwidth/validate-import":
+                return self._validate_import_rows(body, scope="bandwidth")
 
             if path == "/api/subnets":
                 return self._upsert_subnet(body, actor)
             if path == "/api/subnets/import":
                 return self._import_rows(body, actor, scope="subnets")
+            if path == "/api/subnets/validate-import":
+                return self._validate_import_rows(body, scope="subnets")
 
             m = re.match(r"^/api/lists/([^/]+)$", path)
             if m:
@@ -307,6 +313,68 @@ class Handler(BaseHTTPRequestHandler):
         storage.log_audit(actor, f"import_{scope}", {"count": len(rows), "mode": mode})
         return self._send_json({"imported": len(rows), "mode": mode})
 
+    def _validate_import_rows(self, body, scope):
+        """Run validation and diff against a proposed import payload.
+
+        Reads the same payload format as the corresponding import endpoint
+        but never writes to the database.  Returns::
+
+            {
+                "findings": [...],   # same schema as the generate endpoint
+                "diff":     {        # change preview (see core/diff.py)
+                    "new":       [...],
+                    "modified":  [...],
+                    "unchanged": int,
+                    "removed":   [...]
+                }
+            }
+
+        Both the validation engine and the diff engine share the same
+        already-loaded inventory lists so only one round of DB reads occurs.
+
+        Scope semantics — validation
+        ----------------------------
+        devices   — validate only the imported device rows against each other.
+                    Existing bandwidth and subnets are excluded so orphan checks
+                    do not produce noise about data outside this import.
+        bandwidth — validate imported bandwidth rows cross-referenced against
+                    the live device inventory so BW_ORPHANED findings are
+                    meaningful.
+        subnets   — validate only the imported subnet rows against each other.
+
+        Scope semantics — diff
+        ----------------------
+        All scopes compare incoming rows against the full current inventory for
+        that scope.  The ``mode`` field from the request body is used to decide
+        whether to include ``removed`` records (replace mode only).
+        """
+        key = {"devices": "devices", "bandwidth": "rows", "subnets": "subnets"}[scope]
+        rows = body.get(key)
+        if not isinstance(rows, list):
+            return self._send_json({"error": f"'{key}' must be a list"}, 400)
+
+        mode = body.get("mode", "merge")
+        tag_defs = storage.list_tag_defs()
+
+        # Load existing inventory once; reuse for both validation and diff.
+        existing_devices  = storage.list_devices()
+        existing_bandwidth = storage.list_bandwidth()
+        existing_subnets  = storage.list_subnets()
+
+        if scope == "devices":
+            findings = validator.validate_inventory(rows, [], [], tag_defs)
+            diff_result = differ.diff_import("devices", rows, existing_devices, mode, tag_defs)
+        elif scope == "bandwidth":
+            findings = validator.validate_inventory(existing_devices, rows, [], tag_defs)
+            diff_result = differ.diff_import("bandwidth", rows, existing_bandwidth, mode, tag_defs)
+        elif scope == "subnets":
+            findings = validator.validate_inventory([], [], rows, tag_defs)
+            diff_result = differ.diff_import("subnets", rows, existing_subnets, mode, tag_defs)
+        else:
+            return self._send_json({"error": "unknown scope"}, 400)
+
+        return self._send_json({"findings": findings, "diff": diff_result})
+
     def _set_list(self, list_name, body, actor):
         if list_name not in storage.FIXED_LISTS:
             return self._send_json({"error": f"unknown list '{list_name}'"}, 404)
@@ -342,6 +410,11 @@ class Handler(BaseHTTPRequestHandler):
 
         rendered_files = {name: yamldump.dump(config) for name, config in result["files"].items()}
         result["files"] = rendered_files
+
+        # Run validation on the same in-memory data — no additional SQLite reads.
+        result["findings"] = validator.validate_inventory(
+            devices, bandwidth, subnets, tag_defs
+        )
 
         storage.save_history(actor, result["summary"], rendered_files)
         storage.log_audit(actor, "generate", {"summary": result["summary"]})

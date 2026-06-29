@@ -331,24 +331,44 @@ const Bandwidth = (() => {
         records.push(rec);
       }
 
+      importBtn.disabled = true;
+      importBtn.textContent = 'Validating\u2026';
+      let findings = [], diff = null;
       try {
-        importBtn.disabled = true;
-        importBtn.textContent = 'Importing\u2026';
-        await Api.importBandwidth(records, mode);
-        await TagFields.registerNewValuesFromImport('bandwidth', records);
-        const msg = skippedInvalidIp > 0
-          ? `Imported ${records.length} row(s) (${mode}) \u2014 skipped ${skippedInvalidIp} row(s) with an invalid IP`
-          : `Imported ${records.length} row(s) (${mode})`;
-        toast(msg, skippedInvalidIp > 0 ? 'warn' : 'success');
-        closeModal(overlay);
-        await reloadAllData();
-        render();
-        refreshCounts();
+        const result = await Api.validateImportBandwidth(records, mode);
+        findings = result.findings || [];
+        diff = result.diff || null;
       } catch (e) {
-        reportError(e, 'Import failed');
+        reportError(e, 'Validation failed');
         importBtn.disabled = false;
         importBtn.textContent = 'Import';
+        return;
       }
+
+      async function doImport() {
+        importBtn.disabled = true;
+        importBtn.textContent = 'Importing\u2026';
+        try {
+          await Api.importBandwidth(records, mode);
+          await TagFields.registerNewValuesFromImport('bandwidth', records);
+          const msg = skippedInvalidIp > 0
+            ? `Imported ${records.length} row(s) (${mode}) \u2014 skipped ${skippedInvalidIp} row(s) with an invalid IP`
+            : `Imported ${records.length} row(s) (${mode})`;
+          toast(msg, skippedInvalidIp > 0 ? 'warn' : 'success');
+          closeModal(overlay);
+          await reloadAllData();
+          render();
+          refreshCounts();
+        } catch (e) {
+          reportError(e, 'Import failed');
+          importBtn.disabled = false;
+          importBtn.textContent = 'Import';
+        }
+      }
+
+      showImportPreviewModal(findings, diff, state.tagDefs, 'Bandwidth', doImport);
+      importBtn.disabled = false;
+      importBtn.textContent = 'Import';
     });
   }
 

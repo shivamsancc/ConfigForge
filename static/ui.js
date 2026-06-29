@@ -287,3 +287,257 @@ function icon(name, { size = 16, className = '' } = {}) {
   if (!body) return '';
   return `<svg class="icon-svg ${className}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
 }
+
+// ---------------------------------------------------------------------------
+// Import validation utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Append finding banners (banner-danger for errors, banner-warn for warnings)
+ * to a container element.  Optionally filters out codes in `skipCodes`.
+ *
+ * @param {HTMLElement} container  - DOM element to append banners into.
+ * @param {Array}       findings   - Finding objects from the validation engine.
+ * @param {Set}         [skipCodes] - Optional set of code strings to suppress.
+ */
+function renderFindingsBanners(container, findings, skipCodes = new Set()) {
+  findings
+    .filter(f => !skipCodes.has(f.code))
+    .forEach(f => {
+      const cls = f.severity === 'error' ? 'banner-danger' : 'banner-warn';
+      const div = document.createElement('div');
+      div.className = `banner ${cls}`;
+      div.innerHTML = `
+        <span>${icon('warning', { size: 16 })}</span>
+        <div class="banner-content">${escapeHtml(f.message)}</div>
+      `;
+      container.appendChild(div);
+    });
+}
+
+/**
+ * Show a modal summarising import validation findings, then call onProceed()
+ * if the user confirms.
+ *
+ * Behaviour:
+ *  - No findings            → modal is skipped entirely; onProceed() called immediately.
+ *  - Warnings only          → yellow header; "Proceed" button available.
+ *  - Any errors present     → red header; "Proceed anyway" button available (errors
+ *                             require explicit acknowledgement but do not hard-block).
+ *
+ * @param {Array}    findings   - Finding objects (may be empty).
+ * @param {string}   scopeLabel - Short label for the modal title, e.g. "Devices".
+ * @param {Function} onProceed  - Async-safe callback invoked if the user confirms.
+ */
+function showImportValidationModal(findings, scopeLabel, onProceed) {
+  if (!findings || findings.length === 0) {
+    onProceed();
+    return;
+  }
+
+  const hasErrors   = findings.some(f => f.severity === 'error');
+  const errorCount  = findings.filter(f => f.severity === 'error').length;
+  const warnCount   = findings.filter(f => f.severity === 'warning').length;
+
+  const headerClass = hasErrors ? 'banner-danger' : 'banner-warn';
+  const proceedLabel = hasErrors ? 'Proceed anyway' : 'Proceed';
+
+  const summaryParts = [];
+  if (errorCount) summaryParts.push(`${errorCount} error${errorCount !== 1 ? 's' : ''}`);
+  if (warnCount)  summaryParts.push(`${warnCount} warning${warnCount !== 1 ? 's' : ''}`);
+
+  const rows = findings.map(f => {
+    const badgeCls = f.severity === 'error' ? 'badge-danger' : 'badge-warn';
+    return `
+      <tr>
+        <td><span class="badge ${badgeCls}">${escapeHtml(f.severity)}</span></td>
+        <td class="mono" style="font-size:0.78rem;">${escapeHtml(f.code)}</td>
+        <td>${escapeHtml(f.message)}</td>
+      </tr>`;
+  }).join('');
+
+  const overlay = openModal(`
+    <div class="modal-header">
+      <h3>${icon('warning', { size: 16 })} ${escapeHtml(scopeLabel)} Import — ${summaryParts.join(', ')}</h3>
+      <button class="modal-close" data-act="cancel">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="text-dim mb-12">
+        ${hasErrors
+          ? 'The following issues were found. You may still proceed, but errors may cause records to be skipped during generation.'
+          : 'The following warnings were found. Review them before proceeding.'}
+      </p>
+      <table>
+        <thead>
+          <tr><th style="width:80px;">Severity</th><th style="width:190px;">Code</th><th>Message</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" data-act="cancel">Cancel</button>
+      <button class="btn ${hasErrors ? 'btn-danger' : 'btn-primary'}" data-act="proceed">${escapeHtml(proceedLabel)}</button>
+    </div>
+  `, { large: true });
+
+  overlay.querySelectorAll('[data-act="cancel"]').forEach(b =>
+    b.addEventListener('click', () => closeModal(overlay))
+  );
+  overlay.querySelector('[data-act="proceed"]').addEventListener('click', () => {
+    closeModal(overlay);
+    onProceed();
+  });
+}
+
+/**
+ * Show a combined Import Preview modal containing:
+ *   1. Validation findings (if any) — same banners as renderFindingsBanners.
+ *   2. Change summary — counts of new / modified / unchanged / removed records.
+ *   3. Modified detail — expandable per-record list with field-level diffs.
+ *
+ * If there are no findings AND no changes (nothing new, modified, or removed)
+ * the modal still appears so the operator can see the "all unchanged" state
+ * before committing.
+ *
+ * @param {Array}    findings   - Validation findings from the server.
+ * @param {Object}   diff       - Diff object: {new, modified, unchanged, removed}.
+ * @param {Object}   tagDefs    - Tag definitions array (state.tagDefs) for name lookup.
+ * @param {string}   scopeLabel - Human label, e.g. "Devices".
+ * @param {Function} onProceed  - Called when user confirms.
+ */
+function showImportPreviewModal(findings, diff, tagDefs, scopeLabel, onProceed) {
+  findings = findings || [];
+  diff = diff || { new: [], modified: [], unchanged: 0, removed: [] };
+  tagDefs = tagDefs || [];
+
+  const hasErrors  = findings.some(f => f.severity === 'error');
+  const hasWarnings = findings.some(f => f.severity === 'warning');
+
+  // ── Findings section ────────────────────────────────────────────────────
+  const findingsHtml = findings.length === 0 ? '' : `
+    <div style="margin-bottom:16px;">
+      <div style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;">Validation</div>
+      ${findings.map(f => {
+        const cls = f.severity === 'error' ? 'banner-danger' : 'banner-warn';
+        return `<div class="banner ${cls}" style="margin-bottom:4px;">
+          <span>${icon('warning', { size: 14 })}</span>
+          <div class="banner-content" style="font-size:0.82rem;">${escapeHtml(f.message)}</div>
+        </div>`;
+      }).join('')}
+    </div>`;
+
+  // ── Summary badges ───────────────────────────────────────────────────────
+  const { new: newItems, modified, unchanged, removed } = diff;
+  const newCount  = newItems.length;
+  const modCount  = modified.length;
+  const remCount  = removed.length;
+
+  const summaryCells = [
+    newCount  > 0 ? `<span style="color:var(--green,#4caf50);font-weight:600;">+${newCount} new</span>` : '',
+    modCount  > 0 ? `<span style="color:var(--blue,#5b9bd5);font-weight:600;">~${modCount} modified</span>` : '',
+    `<span style="color:var(--text-dim);">=${unchanged} unchanged</span>`,
+    remCount  > 0 ? `<span style="color:var(--red,#e05252);font-weight:600;">&#x2212;${remCount} removed</span>` : '',
+  ].filter(Boolean).join('<span style="color:var(--text-dim);padding:0 6px;">·</span>');
+
+  const summaryHtml = `
+    <div style="display:flex;align-items:center;gap:0;flex-wrap:wrap;padding:10px 0 14px 0;border-bottom:1px solid var(--border-soft);margin-bottom:14px;font-size:0.9rem;">
+      ${summaryCells}
+    </div>`;
+
+  // ── Modified detail list ─────────────────────────────────────────────────
+  const modifiedHtml = modified.length === 0 ? '' : (() => {
+    const items = modified.map((item, idx) => {
+      const changeRows = item.changes.map(ch => {
+        if (ch.credential) {
+          return `<div style="display:flex;gap:8px;align-items:baseline;padding:2px 0 2px 16px;font-size:0.82rem;">
+            <span style="color:var(--text-dim);min-width:140px;flex-shrink:0;">${escapeHtml(ch.field)}</span>
+            <span style="color:var(--text-dim);font-style:italic;">credential updated</span>
+          </div>`;
+        }
+        const oldDisplay = ch.old === '' ? '<em style="color:var(--text-dim);">(empty)</em>' : `<span>${escapeHtml(ch.old)}</span>`;
+        const newDisplay = ch.new === '' ? '<em style="color:var(--text-dim);">(empty)</em>' : `<span style="color:var(--green,#4caf50);">${escapeHtml(ch.new)}</span>`;
+        return `<div style="display:flex;gap:8px;align-items:baseline;padding:2px 0 2px 16px;font-size:0.82rem;">
+          <span style="color:var(--text-dim);min-width:140px;flex-shrink:0;">${escapeHtml(ch.field)}</span>
+          <span style="text-decoration:line-through;color:var(--text-dim);">${oldDisplay instanceof Object ? '' : escapeHtml(ch.old) || '<em>(empty)</em>'}</span>
+          <span style="color:var(--text-dim);">→</span>
+          <span style="color:var(--green,#4caf50);">${escapeHtml(ch.new) || '<em style="color:var(--text-dim);">(empty)</em>'}</span>
+        </div>`;
+      }).join('');
+
+      return `<div style="border-bottom:1px solid var(--border-soft);">
+        <button class="diff-toggle-btn" data-idx="${idx}" style="width:100%;text-align:left;padding:7px 4px;background:none;border:none;cursor:pointer;color:var(--text);font-size:0.85rem;display:flex;gap:6px;align-items:center;">
+          <span class="diff-arrow" style="color:var(--text-dim);font-size:0.7rem;transition:transform .15s;">▶</span>
+          <span>${escapeHtml(item.label)}</span>
+          <span style="margin-left:auto;color:var(--text-dim);font-size:0.78rem;">${item.changes.length} field${item.changes.length !== 1 ? 's' : ''} changed</span>
+        </button>
+        <div class="diff-detail-panel" data-idx="${idx}" style="display:none;padding-bottom:6px;">${changeRows}</div>
+      </div>`;
+    }).join('');
+
+    return `
+      <div style="margin-bottom:12px;">
+        <div style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);margin-bottom:6px;">Modified (${modified.length})</div>
+        <div id="diff-modified-list" style="border:1px solid var(--border-soft);border-radius:6px;overflow:hidden;max-height:280px;overflow-y:auto;">
+          ${items}
+        </div>
+      </div>`;
+  })();
+
+  // ── Removed list (replace mode) ──────────────────────────────────────────
+  const removedHtml = removed.length === 0 ? '' : (() => {
+    const MAX_SHOWN = 8;
+    const shown = removed.slice(0, MAX_SHOWN);
+    const extra = removed.length - MAX_SHOWN;
+    const labels = shown.map(r => `<li style="font-size:0.83rem;padding:1px 0;">${escapeHtml(r.label)}</li>`).join('');
+    const more = extra > 0 ? `<li style="font-size:0.83rem;color:var(--text-dim);">…and ${extra} more</li>` : '';
+    return `
+      <div style="margin-bottom:12px;">
+        <div style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--red,#e05252);margin-bottom:6px;">Removed (${removed.length}) — replace mode</div>
+        <ul style="margin:0;padding-left:18px;list-style:disc;">${labels}${more}</ul>
+      </div>`;
+  })();
+
+  // ── Footer button label ──────────────────────────────────────────────────
+  const proceedLabel = hasErrors ? 'Proceed anyway' : 'Proceed with Import';
+  const proceedClass = hasErrors ? 'btn-danger' : 'btn-primary';
+
+  const overlay = openModal(`
+    <div class="modal-header">
+      <h3>${icon('import', { size: 16 })} Import Preview — ${escapeHtml(scopeLabel)}</h3>
+      <button class="modal-close" data-act="cancel">&times;</button>
+    </div>
+    <div class="modal-body">
+      ${findingsHtml}
+      ${summaryHtml}
+      ${modifiedHtml}
+      ${removedHtml}
+      ${newCount === 0 && modCount === 0 && remCount === 0
+        ? `<p class="text-dim" style="margin:0;">All ${unchanged} record(s) are identical to what is already in the database. No changes will be made.</p>`
+        : ''}
+    </div>
+    <div class="modal-footer">
+      <button class="btn" data-act="cancel">Cancel</button>
+      <button class="btn ${proceedClass}" data-act="proceed">${escapeHtml(proceedLabel)}</button>
+    </div>
+  `, { large: true });
+
+  // Expand/collapse modified items.
+  overlay.querySelectorAll('.diff-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = btn.dataset.idx;
+      const panel = overlay.querySelector(`.diff-detail-panel[data-idx="${idx}"]`);
+      const arrow = btn.querySelector('.diff-arrow');
+      const open = panel.style.display === 'none';
+      panel.style.display = open ? 'block' : 'none';
+      arrow.style.transform = open ? 'rotate(90deg)' : '';
+    });
+  });
+
+  overlay.querySelectorAll('[data-act="cancel"]').forEach(b =>
+    b.addEventListener('click', () => closeModal(overlay))
+  );
+  overlay.querySelector('[data-act="proceed"]').addEventListener('click', () => {
+    closeModal(overlay);
+    onProceed();
+  });
+}

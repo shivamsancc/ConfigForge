@@ -87,6 +87,17 @@ const Generate = (() => {
     if (mc) mc.addEventListener('click', () => showMissingCredsModal(result.missingCredsDevices));
     const mr = document.getElementById('btn-view-missing-region');
     if (mr) mr.addEventListener('click', () => showMissingRegionModal(result.missingRegionDevices));
+
+    // Render validation engine findings, skipping codes already surfaced by
+    // the legacy banners above.  To graduate a code out of LEGACY_CODES:
+    // remove it here and update the banner logic above to stop handling it.
+    const LEGACY_CODES = new Set([
+      'DEVICE_MISSING_CREDS', // banner-warn + modal above
+      'DEVICE_NO_REGION',     // banner-danger + modal above
+      'DEVICE_NO_IP',         // stats row above
+      'BW_ORPHANED',          // stats row above
+    ]);
+    renderFindingsBanners(el, result.findings || [], LEGACY_CODES);
   }
 
   function renderResult(result) {

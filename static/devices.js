@@ -512,25 +512,48 @@ const Devices = (() => {
         records.push(rec);
       }
 
+      // Validate before writing.  If the server returns findings, show the
+      // modal and let the user decide.  On confirm (or if no findings),
+      // proceed directly to the write.
+      importBtn.disabled = true;
+      importBtn.textContent = 'Validating\u2026';
+      let findings = [], diff = null;
       try {
-        importBtn.disabled = true;
-        importBtn.textContent = 'Importing\u2026';
-        await Api.importDevices(records, mode);
-        await TagFields.registerNewValuesFromImport('devices', records);
-        await registerNewCollectorRegionsFromImport(records);
-        const msg = skippedInvalidIp > 0
-          ? `Imported ${records.length} device(s) (${mode}) \u2014 skipped ${skippedInvalidIp} row(s) with an invalid IP`
-          : `Imported ${records.length} device(s) (${mode})`;
-        toast(msg, skippedInvalidIp > 0 ? 'warn' : 'success');
-        closeModal(overlay);
-        await reloadAllData();
-        render();
-        refreshCounts();
+        const result = await Api.validateImportDevices(records, mode);
+        findings = result.findings || [];
+        diff = result.diff || null;
       } catch (e) {
-        reportError(e, 'Import failed');
+        reportError(e, 'Validation failed');
         importBtn.disabled = false;
         importBtn.textContent = 'Import';
+        return;
       }
+
+      async function doImport() {
+        importBtn.disabled = true;
+        importBtn.textContent = 'Importing\u2026';
+        try {
+          await Api.importDevices(records, mode);
+          await TagFields.registerNewValuesFromImport('devices', records);
+          await registerNewCollectorRegionsFromImport(records);
+          const msg = skippedInvalidIp > 0
+            ? `Imported ${records.length} device(s) (${mode}) \u2014 skipped ${skippedInvalidIp} row(s) with an invalid IP`
+            : `Imported ${records.length} device(s) (${mode})`;
+          toast(msg, skippedInvalidIp > 0 ? 'warn' : 'success');
+          closeModal(overlay);
+          await reloadAllData();
+          render();
+          refreshCounts();
+        } catch (e) {
+          reportError(e, 'Import failed');
+          importBtn.disabled = false;
+          importBtn.textContent = 'Import';
+        }
+      }
+
+      showImportPreviewModal(findings, diff, state.tagDefs, 'Devices', doImport);
+      importBtn.disabled = false;
+      importBtn.textContent = 'Import';
     });
   }
 
