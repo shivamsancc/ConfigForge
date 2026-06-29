@@ -28,11 +28,26 @@ Example shutdown output
 from __future__ import annotations
 
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from core.logging.factory import get_logger
 
 _lifecycle_logger = get_logger("configfoundry.lifecycle")
+
+
+def _meta_get(meta: Any, key: str, default: str = "") -> str:
+    """
+    Read a field from a ``ProviderMetadata`` dataclass or a plain dict.
+
+    ``StorageProvider.get_metadata()`` returns a ``ProviderMetadata``
+    dataclass, but callers (especially tests) may also pass a plain dict.
+    This helper handles both without requiring an import of the dataclass.
+    """
+    if meta is None:
+        return default
+    if isinstance(meta, dict):
+        return str(meta.get(key, default))
+    return str(getattr(meta, key, default))
 
 
 def log_startup_info(
@@ -40,7 +55,7 @@ def log_startup_info(
     app_version: str,
     api_version: str,
     api_prefix: str = "",
-    provider_meta: Optional[dict[str, Any]] = None,
+    provider_meta: Any = None,
     log_config=None,
     startup_duration_s: float = 0.0,
 ) -> None:
@@ -56,8 +71,9 @@ def log_startup_info(
     api_prefix:
         Full URL prefix, e.g. ``"/api/v1"``.
     provider_meta:
-        Dictionary returned by ``StorageProvider.get_metadata()``.
-        Expected keys: ``name``, ``version``, ``dialect`` (all optional).
+        ``ProviderMetadata`` dataclass returned by
+        ``StorageProvider.get_metadata()``, or a plain dict with the same
+        keys (``name``, ``version``, ``dialect``).  ``None`` is safe.
     log_config:
         ``LoggingConfig`` instance — used to report the log file path and
         rotation mode.  ``None`` means logging defaults were used.
@@ -65,8 +81,6 @@ def log_startup_info(
         Wall-clock seconds elapsed between the start of ``create_app()``
         and the end of the lifespan startup block.
     """
-    provider_meta = provider_meta or {}
-
     _lifecycle_logger.info("ConfigFoundry v%s starting up", app_version)
 
     _lifecycle_logger.info(
@@ -80,12 +94,12 @@ def log_startup_info(
         sys.version.split()[0],
     )
 
-    provider_name    = provider_meta.get("name", "unknown")
-    provider_version = provider_meta.get("version", "")
-    provider_dialect = provider_meta.get("dialect", "")
+    provider_name    = _meta_get(provider_meta, "name", "unknown")
+    provider_version = _meta_get(provider_meta, "version", "")
+    provider_dialect = _meta_get(provider_meta, "dialect", "")
 
-    version_part  = f" v{provider_version}" if provider_version else ""
-    dialect_part  = f" (dialect: {provider_dialect})" if provider_dialect else ""
+    version_part = f" v{provider_version}" if provider_version else ""
+    dialect_part = f" (dialect: {provider_dialect})" if provider_dialect else ""
     _lifecycle_logger.info(
         "Storage      : %s%s%s",
         provider_name,
@@ -108,7 +122,7 @@ def log_startup_info(
 
 def log_shutdown_info(
     *,
-    provider_meta: Optional[dict[str, Any]] = None,
+    provider_meta: Any = None,
 ) -> None:
     """
     Emit shutdown information to the lifecycle logger.
@@ -116,11 +130,9 @@ def log_shutdown_info(
     Parameters
     ----------
     provider_meta:
-        Dictionary returned by ``StorageProvider.get_metadata()``.
-        Expected key: ``name``.
+        ``ProviderMetadata`` dataclass or plain dict.  Expected key: ``name``.
     """
-    provider_meta = provider_meta or {}
-    provider_name = provider_meta.get("name", "unknown")
+    provider_name = _meta_get(provider_meta, "name", "unknown")
 
     _lifecycle_logger.info("ConfigFoundry shutting down")
     _lifecycle_logger.info("Closing storage provider: %s", provider_name)
