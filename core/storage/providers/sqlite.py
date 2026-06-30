@@ -1,12 +1,20 @@
 """
 SQLite storage provider — fully functional implementation.
 
-Absorbs the logic previously in ``core/db.py``:
-- Run schema migrations via the existing ``core.migrations`` module
-  (uses a raw sqlite3 connection — migrations.py pre-dates SQLAlchemy).
-- Ensure the fixed Collector Region list row exists.
-- Create a SQLAlchemy engine with WAL journal mode.
-- Expose health checks with round-trip latency measurement.
+Schema management is delegated entirely to Alembic via
+``core.migrations.runner.run_migrations(engine)``.  This provider no
+longer contains migration logic of its own.
+
+Startup sequence
+----------------
+1. Build a SQLAlchemy engine (WAL mode enabled).
+2. Run ``core.migrations.runner.run_migrations(engine)``.
+   - Fresh databases: ``alembic upgrade head`` creates all tables.
+   - Legacy databases (pre-Alembic): stamped at head, no DDL changes.
+   - Alembic-managed databases: ``alembic upgrade head`` is a no-op
+     if already at head, or applies pending migrations.
+3. Seed fixed Collector Region list row (``INSERT OR IGNORE``).
+4. Build a reusable session factory.
 
 Thread safety
 -------------
@@ -24,6 +32,8 @@ from typing import Optional
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from core.logging import get_logger
+from core.migrations.runner import run_migrations
 from core.storage.config import DatabaseConfig
 from core.storage.provider import (
     HealthCheckResult,
@@ -33,7 +43,10 @@ from core.storage.provider import (
     StorageProvider,
 )
 
+_logger = get_logger(__name__)
+
 # Fixed lists that must always exist in the ``lists`` table.
+# Imported here to stay co-located with seeding logic.
 from core.repositories.sqlite.list import FIXED_LISTS
 
 
@@ -41,7 +54,9 @@ class SQLiteProvider(StorageProvider):
     """
     Fully functional SQLite storage provider.
 
-    Supports ``":memory:"`` databases for in-process testing.
+    Supports ``":memory:"`` databases for in-process testing (each
+    ``ServiceContainer`` instance gets a fully initialised, isolated
+    in-memory database).
 
     Parameters
     ----------
@@ -61,26 +76,35 @@ class SQLiteProvider(StorageProvider):
 
     def initialize(self) -> None:
         """
-        Run migrations, ensure fixed seed rows, and create the engine.
+        Build the engine, run Alembic migrations, and seed fixed data.
 
-        Safe to call multiple times — ``create_engine`` is idempotent when
-        the engine already exists; migrations skip already-applied versions.
+        Idempotent: calling ``initialize()`` more than once re-initialises
+        the engine (safe for test fixtures that call it repeatedly).
         """
         db_path = self._config.sqlite_path
 
-        # Step 1: Run schema migrations using a raw sqlite3 connection.
-        # migrations.py predates SQLAlchemy and must stay on the sqlite3 API.
-        self._run_migrations(db_path)
-
-        # Step 2: Create the SQLAlchemy engine.
+        # Step 1: Build the SQLAlchemy engine.
+        # Engine is built FIRST so we can pass it to the migration runner,
+        # which reuses the same connection pool (essential for :memory: DBs).
         self._engine = self._build_engine(db_path)
+
+        # Step 2: Run Alembic migrations.
+        # - Fresh DBs: creates all tables via baseline migration.
+        # - Legacy DBs (meta table exists, no alembic_version): stamps head.
+        # - Managed DBs: upgrade head (no-op or applies pending revisions).
+        _logger.info("Running database migrations for %s", db_path)
+        run_migrations(self._engine)
 
         # Step 3: Build a reusable session factory.
         self._session_factory_obj = sessionmaker(bind=self._engine)
 
+        # Step 4: Seed fixed lists (idempotent — INSERT OR IGNORE).
+        self._seed_fixed_lists()
+
     def shutdown(self) -> None:
         """Dispose the connection pool and release all file handles."""
         if self._engine is not None:
+            _logger.info("Shutting down SQLiteProvider for %s", self._config.sqlite_path)
             self._engine.dispose()
             self._engine = None
             self._session_factory_obj = None
@@ -165,33 +189,27 @@ class SQLiteProvider(StorageProvider):
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _run_migrations(self, db_path: str) -> None:
-        """Run pending migrations and seed fixed lists using raw sqlite3."""
-        from core import migrations as _migrations
-
-        raw = sqlite3.connect(db_path)
-        raw.row_factory = sqlite3.Row
-        try:
-            _migrations.run_pending_migrations(raw)
-            for name in FIXED_LISTS:
-                raw.execute(
-                    "INSERT OR IGNORE INTO lists (list_name, items) VALUES (?, ?)",
-                    (name, json.dumps([])),
-                )
-            raw.commit()
-        finally:
-            raw.close()
-
     def _build_engine(self, db_path: str) -> Engine:
         """Create the SQLAlchemy engine with WAL mode and correct connect args."""
         connect_args = {"check_same_thread": False}
         connect_args.update(self._config.connect_args)
 
-        engine = create_engine(
-            f"sqlite:///{db_path}",
-            connect_args=connect_args,
-            echo=self._config.echo,
-        )
+        if db_path == ":memory:":
+            # In-memory databases require StaticPool so all connections
+            # (including Alembic's) share the same underlying DBAPI connection.
+            from sqlalchemy.pool import StaticPool
+            engine = create_engine(
+                "sqlite:///:memory:",
+                connect_args=connect_args,
+                poolclass=StaticPool,
+                echo=self._config.echo,
+            )
+        else:
+            engine = create_engine(
+                f"sqlite:///{db_path}",
+                connect_args=connect_args,
+                echo=self._config.echo,
+            )
 
         # Enable WAL journal mode on every new DBAPI connection.
         @event.listens_for(engine, "connect")
@@ -200,10 +218,24 @@ class SQLiteProvider(StorageProvider):
 
         return engine
 
+    def _seed_fixed_lists(self) -> None:
+        """
+        Ensure the Collector Region managed list row exists.
+
+        Uses ``INSERT OR IGNORE`` semantics via SQLAlchemy so it is safe
+        to call on every startup without duplicating data.
+        """
+        from models.inventory import ListModel
+
+        with Session(self._engine) as session:
+            for name in FIXED_LISTS:
+                if session.get(ListModel, name) is None:
+                    session.add(ListModel(list_name=name, items=json.dumps([])))
+            session.commit()
+
     def _query_version(self) -> str:
         """Return the SQLite library version string, or ``"unknown"``."""
         if self._engine is None:
-            # Engine not yet built — ask the sqlite3 stdlib directly.
             return sqlite3.sqlite_version
         try:
             with Session(self._engine) as session:

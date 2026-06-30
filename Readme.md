@@ -83,9 +83,58 @@ python3 server.py --help
   --no-browser      Don't open a browser tab on startup
 ```
 
-### Development mode (auto-reload)
+### Frontend (Next.js)
 
-`server.py` does not pass `--reload` to uvicorn. For live reload during development, create a one-line shim and run uvicorn directly:
+The frontend is built with **Next.js 15 (App Router) + TypeScript + TanStack Query**. For production it compiles to a static site (`frontend/out/`) that FastAPI serves automatically. The legacy `static/` vanilla-JS UI remains as a fallback if the Next.js build has not been run.
+
+**First-time setup (install Node dependencies):**
+
+```bash
+cd frontend && npm install
+```
+
+**Development mode — two servers, one command:**
+
+```bash
+make dev
+```
+
+This starts FastAPI on `:8420` and the Next.js dev server on `:3001` in parallel. The dev server proxies `/api/*` to FastAPI, so the UI always talks to the real backend. Open `http://localhost:3001/` in your browser. You can also start them separately:
+
+```bash
+make dev-backend     # FastAPI on :8420
+make dev-frontend    # Next.js on :3001
+```
+
+**Production build — single port, single command:**
+
+```bash
+make build    # compiles Next.js → frontend/out/
+python3 server.py  # FastAPI serves frontend/out/ at /
+```
+
+Or in one step:
+
+```bash
+make serve
+```
+
+After `make build`, `python3 server.py` automatically detects `frontend/out/` and serves it instead of `static/`. There is no separate Node process at runtime.
+
+**Pages:**
+
+| Page | URL | Description |
+|------|-----|-------------|
+| Dashboard | `/dashboard` | Inventory totals, recent activity, generation status |
+| Inventory | `/inventory` | Devices, Bandwidth, Subnets — search, sort, paginate, import, edit, delete |
+| Validation | `/validation` | Run generation and display findings with severity badges |
+| Generate YAML | `/generate` | Generate, preview, and download YAML config files |
+| History | `/history` | YAML generation history + Audit log |
+| Settings | `/settings` | Tag definitions and managed lists |
+
+### Development mode (auto-reload, backend only)
+
+`server.py` does not pass `--reload` to uvicorn. For live reload of the **Python backend** only, create a one-line shim and run uvicorn directly:
 
 ```python
 # dev.py
@@ -327,28 +376,19 @@ whether it fits:
   not editing the same device simultaneously) this hasn't been a problem in
   practice, but it's not battle-tested under heavy concurrent write load and
   you should know that going in.
-- **Test suite covers the backend only.** The `tests/` directory contains 447 passing tests across repositories, services, handlers, the storage abstraction layer, and the logging framework. Frontend behaviour is still verified by hand against a real browser.
+- **Test suite covers the backend only.** The `tests/` directory contains 476 passing tests across repositories, services, handlers, the storage abstraction layer, the logging framework, and database migrations. Frontend behaviour is still verified by hand against a real browser.
 
 ## Upgrading
 
-Updating ConfigForge is: copy the new `.py` and `static/` files over the old
-ones, restart the server. That's the whole process &mdash; no manual migration
-script to remember, no risk of forgetting a step.
+Updating ConfigForge is: copy the new `.py` and `static/` files over the old ones, restart the server. That's the whole process — no manual migration script to remember, no risk of forgetting a step.
 
-Every change to the database shape lives in `migrations.py` as a small, numbered,
-idempotent function. On every startup, the server checks which migrations have
-already applied to your specific `.db` file (tracked in a `schema_version` row)
-and runs only the ones it hasn't seen yet, in order, each in its own transaction.
-If a migration fails, it rolls back and the server refuses to start with that
-database &mdash; your data is left exactly as it was, and the console tells you to
-back up the file before retrying.
+Database schema changes are managed by [Alembic](https://alembic.sqlalchemy.org/) (the standard SQLAlchemy migration toolkit). On every startup, `core.migrations.runner` calls `alembic upgrade head`, which applies any migrations that haven't yet run on the live database — and is a no-op if the database is already current. If a migration fails, the server aborts startup and the database is left exactly as it was.
 
-This is also how existing data survives structural changes. For example, when
-Device Class / Device Category / Device Type / Operating Region / Geolocation /
-Region / Center moved from hardcoded fields to the dynamic tag system, the
-migration that made that change automatically promoted every value already in use
-into a real tag definition and rewrote each device's stored data to match &mdash;
-nothing was lost, and no manual cleanup was required.
+**Existing databases are automatically detected.** Databases created before Alembic was introduced (schema_version 4 in the old `meta` table) are detected on first startup and stamped at the baseline revision without any DDL changes. All data is preserved.
+
+Historical data migrations (e.g. when Device Class / Device Category moved from hardcoded fields to the dynamic tag system) live in `core/migrations_legacy.py` for reference.
+
+See [`docs/database-migrations.md`](docs/database-migrations.md) for the full migration reference: CLI commands, how to add a new migration, rollback procedures, multi-database support, and developer guidelines.
 
 ## Security
 
@@ -372,6 +412,7 @@ HTTP layer       FastAPI routes (api/) — receive requests, validate with Pydan
 Service layer    core/services/ — pure business logic, no HTTP or DB code
 Repository layer core/repositories/ — data access via ABC interfaces; SQLAlchemy implementations
 Storage layer    core/storage/ — StorageProvider ABC + factory; SQLiteProvider (full), PostgreSQL/MySQL/SQL Server (scaffolds)
+Migration layer  alembic/ + core/migrations/ — Alembic-managed schema versioning, auto-applied at startup
 Logging layer    core/logging/ — centralized logging, structured output, correlation IDs, log rotation
 ```
 
@@ -400,10 +441,18 @@ core/
       postgresql.py          PostgreSQLProvider — scaffold (interface-compliant, initialize() raises)
       mysql.py               MySQLProvider — scaffold
       sqlserver.py           SQLServerProvider — scaffold
+  migrations/
+    runner.py                Programmatic Alembic API — run_migrations(engine)
+  migrations_legacy.py       Legacy custom migration system (reference only, not called)
   repositories/
     interfaces/              ABC interfaces for every entity (IDeviceRepository, etc.)
     sqlalchemy/              SQLAlchemy 2.x implementations (8 repos, all accept StorageProvider)
   services/                  Business logic services (DeviceService, GenerateService, etc.)
+alembic/
+  env.py                     Alembic environment — multi-provider connection wiring
+  versions/
+    0001_baseline_schema.py  Baseline: creates all 8 tables (revision c1f4e7a8b2d0)
+alembic.ini                  Alembic config (default SQLite URL, script location)
 api/
   dependencies.py            Depends(get_container) — resolves ServiceContainer from request.app.state
   v1/
@@ -411,7 +460,6 @@ api/
     devices.py  bandwidth.py FastAPI routers (one per entity)
     subnets.py  tags.py  …
 schemas/common.py            Pydantic v2 request/response models
-migrations.py                Versioned, idempotent SQLite schema migrations
 logic.py                     Core YAML conversion — pure functions, no HTTP or DB code
 aesgcm.py                    AES-256-GCM credential encryption
 static/
@@ -422,7 +470,7 @@ static/
   ui.js                      Icons, toasts, modals, shared helpers
 ```
 
-The frontend is intentionally framework-free — plain HTML/CSS/JS served as static files, with [SheetJS](https://sheetjs.com/) vendored locally for `.xlsx` parsing. There's no build step: edit a `.js` file, refresh the browser.
+The frontend was refactored in v0.5 to **Next.js 15 (App Router) + TypeScript + TanStack Query**. For production, `make build` compiles it to `frontend/out/` which FastAPI serves as static files — no Node process at runtime. The legacy `static/` vanilla-JS UI remains as a fallback. See the [Frontend](#frontend-nextjs) section above for setup and workflow details.
 
 See [`docs/storage-architecture.md`](docs/storage-architecture.md) for the full Storage Abstraction Layer reference, including how to add a new database backend in five steps. See [`docs/logging.md`](docs/logging.md) for the full logging framework reference.
 

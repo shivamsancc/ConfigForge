@@ -213,9 +213,18 @@ def create_app(
     # ------------------------------------------------------------------
     # Static file serving  (MUST come after all include_router calls)
     # ------------------------------------------------------------------
-    _static = static_dir or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "static"
-    )
+    # Priority order:
+    #   1. Explicit static_dir parameter (tests / CI can override)
+    #   2. frontend/out/  — Next.js production build
+    #   3. static/        — legacy vanilla-JS fallback
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if static_dir:
+        _static = static_dir
+    else:
+        _nextjs_out = os.path.join(_here, "frontend", "out")
+        _legacy = os.path.join(_here, "static")
+        _static = _nextjs_out if os.path.isdir(_nextjs_out) else _legacy
+
     if os.path.isdir(_static):
         app.mount("/", StaticFiles(directory=_static, html=True), name="static")
 

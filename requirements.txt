@@ -1,5 +1,6 @@
 fastapi[standard]>=0.100.0
 sqlalchemy>=2.0.0
+alembic>=1.13.0
 pydantic>=2.0.0
 uvicorn[standard]>=0.20.0
 httpx>=0.24.0   # FastAPI TestClient transport
